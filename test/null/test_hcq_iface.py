@@ -1,4 +1,5 @@
 import unittest, array, time
+from unittest.mock import patch
 from tinygrad.helpers import mv_address
 from tinygrad.runtime.support.hcq import MMIOInterface
 from tinygrad.runtime.support.usb import USBMMIOInterface
@@ -59,6 +60,12 @@ class TestUSBMMIOInterface(unittest.TestCase):
     self.buffer = bytearray(self.size)
     self.usb = MockUSB(self.buffer)
     self.mmio = USBMMIOInterface(self.usb, 0, self.size, fmt='B', pcimem=False)
+
+  def test_access_does_not_wait_for_device(self):
+    with patch('tinygrad.runtime.support.usb.Device', create=True) as device:
+      device.__getitem__.return_value.synchronize.side_effect = AssertionError("MMIO cannot wait for the device whose timeline it reads")
+      self.mmio[0] = 42
+      self.assertEqual(self.mmio[0], 42)
 
   def test_getitem_setitem_byte(self):
     self.mmio[1] = 0xAB
