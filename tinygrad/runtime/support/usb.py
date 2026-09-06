@@ -123,6 +123,7 @@ class USB3:
   def bulk_read(self, length:int, timeout:int=1000) -> memoryview:
     if length > len(self._bulk_mv): self._bulk_buf, self._bulk_mv = alloc_cbuffer(length)
     checked(libusb.libusb_bulk_transfer, "bulk IN 0x81 failed")(self.handle, 0x81, self._bulk_buf, length, self._transferred, timeout)
+    assert self._transferred.value == length, f"bulk IN short read: {self._transferred.value}/{length} bytes"
     return self._bulk_mv[:self._transferred.value]
 
   # NOTE: keep it for flash.py

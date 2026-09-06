@@ -1,9 +1,9 @@
-import unittest, array, time
+import unittest, array, time, ctypes
 from unittest.mock import Mock, patch
 from tinygrad.helpers import mv_address
 from tinygrad.runtime.support.hcq import MMIOInterface
 from tinygrad.runtime.support.system import System
-from tinygrad.runtime.support.usb import USBMMIOInterface
+from tinygrad.runtime.support.usb import USB3, USBMMIOInterface, alloc_cbuffer
 from test.mockgpu.usb import MockUSB
 
 class TestHCQIface(unittest.TestCase):
@@ -118,6 +118,19 @@ class TestUSBMMIOInterface(unittest.TestCase):
     self.assertIsInstance(raw, bytes)
     self.assertEqual(list(raw), values)
     self.assertEqual(list(usb3.mem[4:8]), values)
+
+class TestUSBPCITransfers(unittest.TestCase):
+  def test_bulk_read_requires_full_transfer(self):
+    usb = object.__new__(USB3)
+    usb.handle = None
+    usb._bulk_buf, usb._bulk_mv = alloc_cbuffer(4)
+    usb._bulk_mv[:] = b'abcd'
+    for completed in (0, 3, 4):
+      with self.subTest(completed=completed), patch('tinygrad.runtime.support.usb.libusb.libusb_bulk_transfer', return_value=0):
+        usb._transferred = ctypes.c_int(completed)
+        if completed == 4: self.assertEqual(bytes(usb.bulk_read(4)), b'abcd')
+        else:
+          with self.assertRaisesRegex(AssertionError, 'bulk IN short read'): usb.bulk_read(4)
 
 class TestUSBPCIBars(unittest.TestCase):
   def test_resize_all_bars(self):
