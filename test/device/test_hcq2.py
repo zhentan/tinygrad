@@ -13,10 +13,12 @@ from tinygrad.renderer.llvmir import CPULLVMRenderer
 from tinygrad.renderer import Estimates
 from tinygrad.runtime.autogen import libc, libusb
 from tinygrad.runtime.support.nv.usb import usb_stream
+from tinygrad.runtime.support.usb import USBMMIOInterface
 from tinygrad.runtime.support.c import init_c_struct_t
 import tinygrad.runtime.support.hcq2 as hcq2
 from tinygrad.runtime.support.hcq2 import HCQ_DEVS, all_devices_in, hcq_compile_cache, link_linear_cache
 from test.helpers import call_is_hcq
+from test.mockgpu.usb import MockUSB
 
 @contextlib.contextmanager
 def rt_buffers():
@@ -266,6 +268,31 @@ class TestHCQ2Schedule(unittest.TestCase):
       inner_buf, outer_buf = linked.src[1].buffer, linked.without_after.src[1].buffer
       self.assertEqual(inner_buf.host.view(fmt='I')[1], 42)
       self.assertEqual(outer_buf.host.view(fmt='Q')[0], inner_buf._buf + 4)
+
+class TestHCQ2Link(unittest.TestCase):
+  def test_failed_binary_upload_is_not_cached(self):
+    for previous, restore_previous in ((None, False), (b'old!', False), (b'old!', True)):
+      with self.subTest(previous=previous, restore_previous=restore_previous):
+        buf, usb = Buffer("CPU", 4, dtypes.uint8, preallocate=True), MockUSB(bytearray(4))
+        def link(blob):
+          store = UOp.from_buffer(buf).store(UOp(Ops.BINARY, arg=blob).bitcast(dtypes.uint8))
+          return hcq2.hcq_link(UOp(Ops.LINEAR, src=(store,)), allow_cache=False)
+        def fail_write(address, data):
+          usb.mem[address:address+2] = data[:2] # a failed USB transfer can have partially changed the buffer
+          raise RuntimeError("injected USB transfer failure")
+        with patch.object(buf, "_storage", replace(buf.get_storage(), host=USBMMIOInterface(usb, 0, 4, "B"))):
+          if previous is not None: link(previous)
+          with patch.object(usb, "pcie_mem_write", side_effect=fail_write) as failed:
+            with self.assertRaisesRegex(RuntimeError, "injected USB transfer failure"): link(b'new!')
+            failed.assert_called_once()
+          self.assertEqual(usb.mem[:2], b'ne')
+          expected = previous if restore_previous else b'new!'
+          with patch.object(usb, "pcie_mem_write", wraps=usb.pcie_mem_write) as write:
+            link(expected)
+            self.assertEqual(usb.mem, expected)
+            write.assert_called_once_with(0, expected)
+            link(expected)
+            write.assert_called_once() # only successful uploads may be reused
 
 @unittest.skipUnless(isinstance(Device["CPU"].renderer, CStyleLanguage), "CALL is rendered in C style only")
 class TestHCQ2FFI(unittest.TestCase):

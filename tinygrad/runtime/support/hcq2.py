@@ -489,8 +489,9 @@ def resolve_getaddr(ctx:LinkCtx, g:UOp) -> UOp|None:
 
 def fold_binary(buf:UOp, blob:UOp) -> UOp:
   if getattr(b:=cast(Buffer, buf.buffer), '_hcq_written', None) is not blob.arg: # TODO: remove me
-    cast(Any, b.ensure_allocated())._hcq_written = blob.arg
+    cast(Any, b.ensure_allocated())._hcq_written = None
     b.host.view(fmt='B')[:len(blob.arg)] = blob.arg
+    cast(Any, b)._hcq_written = blob.arg
   return UOp(Ops.NOOP)
 
 def fold_words(buf:UOp, offs:UOp, ws:UOp) -> UOp:
