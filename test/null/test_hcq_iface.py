@@ -91,6 +91,16 @@ class TestUSBMMIOInterface(unittest.TestCase):
     self.assertEqual(mmio_pci[3], 0x11223344)
     self.assertEqual(usb2.mem[12:16], b'\x44\x33\x22\x11')
 
+  def test_typed_slice(self):
+    for pcimem in (False, True):
+      for fmt in ('I', 'Q'):
+        with self.subTest(pcimem=pcimem, fmt=fmt):
+          mmio = USBMMIOInterface(self.usb, 0, self.size, fmt=fmt, pcimem=pcimem)
+          values = array.array(fmt, [0x12345678, 0xabcdef01])
+          mmio[1:3] = values
+          self.assertEqual(mmio[1:3], values.tolist())
+          self.assertEqual(array.array(fmt, mmio[1:3]), values)
+
   def test_pcimem_slice(self):
     usb3 = MockUSB(bytearray(self.size))
     mmio_pci = USBMMIOInterface(usb3, 0, self.size, fmt='B', pcimem=True)
