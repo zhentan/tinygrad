@@ -16,10 +16,12 @@ def usb_bulk(devs, dep, endpoint:int, data:UOp, length, timeout:int=1000) -> UOp
   return ccheck(actual.after(done).index(0).load(), length)
 
 def usb_stream(devs, dep:tuple[UOp, ...], addr:UOp, data:UOp, nbytes:int, write:bool) -> UOp:
+  boundary = UOp.const(1 << 32, dtypes.uint64)
+  checked_addr = ccheck(((addr < boundary) & (boundary < addr + UOp.const(nbytes, dtypes.uint64))).cast(dtypes.int32))
   hdr = patch(UOp.placeholder((12,), dtypes.uint8, device=HCQ_RUNTIME_DEV.value, tag="usb_scratch"), [(0, addr)],
-              struct.pack('<QI', 0, nbytes // 4)).after(*dep)
+              struct.pack('<QI', 0, nbytes // 4)).after(*dep, checked_addr)
   arm = _libusb(devs, (), "libusb_control_transfer",
-                0x40, 0xF0, (addr < UOp.const(1 << 32, dtypes.uint64)).where(0, 0x20).cast(dtypes.int) | (0x40 if write else 0) | (0x0F << 8),
+                0x40, 0xF0, (addr < boundary).where(0, 0x20).cast(dtypes.int) | (0x40 if write else 0) | (0x0F << 8),
                 1 if write else 2, hdr.index(0), 12, 5000)
   return usb_bulk(devs, (arm,), 0x02 if write else 0x81, data, nbytes)
 

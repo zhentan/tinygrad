@@ -395,6 +395,15 @@ class TestHCQ2FFI(unittest.TestCase):
             if error[0] == error[1]:
               self.assertEqual(calls[2], ('control', 0xf60, 1, bytes.fromhex('100000000800000001000000')))
               self.assertEqual(calls[-1], ('bulk', 0x02, 4, b'abcd' if write else b'ABCD'))
+        for address in (0xfffffff8, 0x100000000):
+          calls.clear()
+          run_linear(linear, {'usb_addr': address}, jit=True, wait=False)
+          self.assertEqual(calls[0][1], 0xf00 | (0x20 if address >= (1 << 32) else 0) | (0x40 if write else 0))
+          self.assertEqual([c[0] for c in calls], ['control', 'bulk', 'control', 'bulk'])
+        calls.clear()
+        with self.assertRaisesRegex(RuntimeError, "native call returned 1, expected 0"):
+          run_linear(linear, {'usb_addr': 0xfffffffc}, jit=True, wait=False)
+        self.assertEqual(calls, [], "a stream crossing 4 GiB must fail before any USB request")
 
 
 if __name__ == "__main__":

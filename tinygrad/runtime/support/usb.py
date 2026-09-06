@@ -187,12 +187,14 @@ class CustomASM24Controller:
     """Streaming PCIe memory write via 0xF0 mode 1 + bulk OUT. Data is little-endian dwords on the wire."""
     if not data: return
     assert len(data) % 4 == 0, f"pcie_mem_write requires 4-byte aligned size, got {len(data)}"
+    assert address >= (1 << 32) or address + len(data) <= (1 << 32), "PCIe stream crosses 4 GiB"
     self._f0_out(0x60 if address >> 32 else 0x40, 0x0F, address, len(data) // 4, mode=1)
     self.usb.bulk_write(data)
 
   def pcie_mem_read(self, address:int, nbytes:int) -> memoryview:
     """Streaming PCIe memory read via 0xF0 mode 2 + bulk IN. Returns little-endian bytes."""
     assert nbytes % 4 == 0, f"pcie_mem_read requires 4-byte aligned size, got {nbytes}"
+    assert address >= (1 << 32) or address + nbytes <= (1 << 32), "PCIe stream crosses 4 GiB"
     self._f0_out(0x20 if address >> 32 else 0, 0x0F, address, nbytes // 4, mode=2)
     return self.usb.bulk_read(nbytes, timeout=30000)
 

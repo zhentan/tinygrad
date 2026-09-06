@@ -181,6 +181,16 @@ class TestUSBPCITransfers(unittest.TestCase):
           self.assertEqual(int(value), 0xf00 | fmt | (0x40 if write else 0))
           if isinstance(value, UOp): self.assertEqual(value.dtype, dtypes.int)
 
+  def test_cross_4gib_rejected_before_io(self):
+    controller = object.__new__(CustomASM24Controller)
+    controller.usb = Mock()
+    for write in (False, True):
+      with self.subTest(write=write):
+        with self.assertRaisesRegex(AssertionError, 'crosses 4 GiB'):
+          if write: controller.pcie_mem_write(0xfffffffc, b'abcdefgh')
+          else: controller.pcie_mem_read(0xfffffffc, 8)
+        self.assertEqual(controller.usb.mock_calls, [])
+
 class TestUSBPCIBars(unittest.TestCase):
   def test_resize_all_bars(self):
     for count in (0, 1, 3):
