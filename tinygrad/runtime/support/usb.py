@@ -49,23 +49,28 @@ class USB3:
 
     self.handle = c.init_c_var(c.POINTER[libusb.struct_libusb_device_handle], lambda x: checked(libusb.libusb_open)(dev, x))
 
-    # Read product string descriptor
-    _buf = (ctypes.c_ubyte * 256)()
-    _desc = libusb.struct_libusb_device_descriptor()
-    checked(libusb.libusb_get_device_descriptor)(libusb.libusb_get_device(self.handle), ctypes.byref(_desc))
-    _ret = checked(libusb.libusb_get_string_descriptor_ascii)(self.handle, _desc.iProduct, _buf, 256)
-    self.product = bytes(_buf[:_ret]).decode("ascii", errors="replace")
-    assert self.product.startswith("custom") or self.product.startswith("AS2462")
+    try:
+      # Read product string descriptor
+      _buf = (ctypes.c_ubyte * 256)()
+      _desc = libusb.struct_libusb_device_descriptor()
+      checked(libusb.libusb_get_device_descriptor)(libusb.libusb_get_device(self.handle), ctypes.byref(_desc))
+      _ret = checked(libusb.libusb_get_string_descriptor_ascii)(self.handle, _desc.iProduct, _buf, 256)
+      self.product = bytes(_buf[:_ret]).decode("ascii", errors="replace")
+      assert self.product.startswith("custom") or self.product.startswith("AS2462")
 
-    # Detach kernel driver if needed
-    if checked(libusb.libusb_kernel_driver_active)(self.handle, 0):
-      checked(libusb.libusb_detach_kernel_driver)(self.handle, 0)
-      checked(libusb.libusb_reset_device)(self.handle)
+      # Detach kernel driver if needed
+      if checked(libusb.libusb_kernel_driver_active)(self.handle, 0):
+        checked(libusb.libusb_detach_kernel_driver)(self.handle, 0)
+        checked(libusb.libusb_reset_device)(self.handle)
 
-    # Set configuration and claim interface
-    checked(libusb.libusb_set_configuration)(self.handle, 1)
-    checked(libusb.libusb_claim_interface)(self.handle, 0)
-    checked(libusb.libusb_set_interface_alt_setting)(self.handle, 0, 0)
+      # Set configuration and claim interface
+      checked(libusb.libusb_set_configuration)(self.handle, 1)
+      checked(libusb.libusb_claim_interface)(self.handle, 0)
+      checked(libusb.libusb_set_interface_alt_setting)(self.handle, 0, 0)
+    except BaseException:
+      libusb.libusb_close(self.handle)
+      self.handle = type(self.handle)()
+      raise
 
   def control_write(self, request:int, value:int=0, index:int=0, data:bytes=b'', timeout:int=1000):
     assert len(data) <= len(self._ctrl_mv)
