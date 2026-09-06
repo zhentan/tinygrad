@@ -120,6 +120,27 @@ class TestUSBMMIOInterface(unittest.TestCase):
     self.assertEqual(list(usb3.mem[4:8]), values)
 
 class TestUSBPCITransfers(unittest.TestCase):
+  def test_xdata_bounds(self):
+    controller = object.__new__(CustomASM24Controller)
+    controller.usb = Mock()
+    controller.usb.control_read.return_value = b'\xa5'
+    cases = ((0xffff, 1, True), (0, 0, True), (0x10000, 0, True), (-1, 1, False), (-1, 0, False),
+             (0x10000, 1, False), (0x10001, 0, False), (0xffff, 2, False), (0xff00, 0x101, False))
+    for write in (False, True):
+      for address, size, valid in cases + (() if write else ((0, -1, False),)):
+        with self.subTest(write=write, address=address, size=size):
+          controller.usb.reset_mock()
+          op, arg = (controller.write, b'\xa5' * size) if write else (controller.read, size)
+          if not valid:
+            with self.assertRaisesRegex(AssertionError, 'XDATA range'): op(address, arg)
+            self.assertEqual(controller.usb.mock_calls, [])
+          else:
+            result = op(address, arg)
+            if not write: self.assertEqual(result, b'\xa5' * size)
+            if not size: self.assertEqual(controller.usb.mock_calls, [])
+            elif write: controller.usb.control_write.assert_called_once_with(0xE5, value=address, index=0xa5)
+            else: controller.usb.control_read.assert_called_once_with(0xE4, 1, value=address)
+
   def test_bulk_read_requires_full_transfer(self):
     usb = object.__new__(USB3)
     usb.handle = None

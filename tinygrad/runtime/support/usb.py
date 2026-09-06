@@ -198,6 +198,7 @@ class CustomASM24Controller:
 
   def read(self, base_addr:int, length:int) -> bytes:
     """Read from chip XDATA via vendor control IN (bRequest=0xE4). wValue=addr, wLength=size."""
+    assert 0 <= base_addr <= base_addr + length <= 0x10000, "XDATA range outside 16-bit address space"
     result = b''
     for off in range(0, length, 0xFF):
       chunk = min(0xFF, length - off)
@@ -206,6 +207,7 @@ class CustomASM24Controller:
 
   def write(self, base_addr:int, data:bytes):
     """Write to chip XDATA via vendor control OUT (bRequest=0xE5). wValue=addr, wIndex=val."""
+    assert 0 <= base_addr <= base_addr + len(data) <= 0x10000, "XDATA range outside 16-bit address space"
     for off, val in enumerate(data): self.usb.control_write(0xE5, value=base_addr + off, index=val)
 
   def scsi_write(self, buf:bytes, slot_start:int=0):
