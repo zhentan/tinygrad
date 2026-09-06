@@ -28,7 +28,7 @@ def test_pci_scan_bus_filters_vendor(monkeypatch):
 
   assert system.System.pci_scan_bus(0x1234, devices=[(0xffff, [0x1111])]) == ["0000:00:01.0"]
 
-@pytest.mark.parametrize("gpu_bus,fail_resize", [(2, False), (2, True)])
+@pytest.mark.parametrize("gpu_bus,fail_resize", [(2, False), (4, False), (2, True)])
 def test_usb_bar_setup(gpu_bus, fail_resize):
   from tinygrad.runtime.autogen import pci
   from tinygrad.runtime.support.system import System
@@ -53,13 +53,57 @@ def test_usb_bar_setup(gpu_bus, fail_resize):
       if fail_resize and offset == 0x110: raise RuntimeError("injected resize failure")
     config[bus][offset] = (config[bus].get(offset, 0) & ~((1 << (size * 8)) - 1)) | value
 
-  if fail_resize:
-    with pytest.raises(RuntimeError, match="injected resize failure"):
+  if gpu_bus == 4 or fail_resize:
+    with pytest.raises((AssertionError, RuntimeError), match="PCI bridge|injected resize failure"):
       System.pci_setup_usb_bars(Mock(pcie_cfg_req=cfg), gpu_bus, 0x10000000, 32 << 30)
-    assert config[2][pci.PCI_COMMAND] == 0x405
+    if gpu_bus == 4: assert not any(bus == 2 for bus, _, _ in writes)
+    else: assert config[2][pci.PCI_COMMAND] == 0x405
   else:
     bars = System.pci_setup_usb_bars(Mock(pcie_cfg_req=cfg), gpu_bus, 0x10000000, 32 << 30)
     assert bars == {0:(0x10000000, 16 << 20), 1:(32 << 30, 32 << 30), 3:(64 << 30, 32 << 20)}
     assert (config[2][0x18] << 32) | (config[2][0x14] & ~0xf) == bars[1][0]
     assert (config[2][0x20] << 32) | (config[2][0x1c] & ~0xf) == bars[3][0]
     assert config[2][pci.PCI_COMMAND] == 0x407
+  assert [config[bus][pci.PCI_PRIMARY_BUS] for bus in (0, 1)] == [gpu_bus << 16 | 0x100, gpu_bus << 16 | 0x201]
+
+@pytest.mark.parametrize("bridges,cold,header,vendor", [(2, True, 0x80, 0x10de), (4, True, 0, 0x1002),
+  (2, False, 0x80, 0x10de), (4, False, 0, 0x1002), (2, True, 0xff, 0xffff), (2, True, 2, 0x10de),
+  (2, True, 0, 0), (256, True, 0, 0x10de)])
+def test_usb_pci_discovery(monkeypatch, bridges, cold, header, vendor):
+  from tinygrad.runtime.autogen import pci
+  import tinygrad.runtime.support.system as system
+
+  buses = [0 if cold else bus | (bus+1) << 8 | bridges << 16 for bus in range(bridges)]
+  writes, setup = [], Mock(return_value={})
+  def cfg(offset, bus, dev, fn, size, value=None):
+    assert (dev, fn) == (0, 0)
+    assert bus <= bridges and bus < 256
+    # An unnumbered bridge must be configured before its child can be reached.
+    if any((buses[i] >> 8) & 0xff != i+1 or (buses[i] >> 16) & 0xff < bus for i in range(bus)):
+      return (1 << (size * 8)) - 1
+    if value is None:
+      if offset == pci.PCI_HEADER_TYPE: return 1 if bus < bridges else header
+      if offset == pci.PCI_VENDOR_ID: return vendor
+      return 0
+    writes.append((bus, offset, value))
+    if bus < bridges:
+      assert (offset, size) == (pci.PCI_PRIMARY_BUS, 4)
+      assert value == bus | (bus+1) << 8 | 0xff0000
+      buses[bus] = value
+    else: assert setup.called
+  usb = Mock(pcie_cfg_req=cfg)
+  monkeypatch.setattr(system, "USB3", Mock(return_value=Mock(product="custom test")))
+  monkeypatch.setattr(system, "CustomASM24Controller", Mock(return_value=usb))
+  monkeypatch.setattr(system.System, "flock_acquire", Mock(return_value=0))
+  monkeypatch.setattr(system.System, "pci_setup_usb_bars", setup)
+  if header & 0x7f or not vendor or bridges == 256:
+    with pytest.raises(AssertionError, match="PCI bridge|PCI endpoint"):
+      system.USBPCIDevice("AM", None, "usb:mock")
+    setup.assert_not_called()
+    assert all(bus < bridges for bus, _, _ in writes)
+  else:
+    dev = system.USBPCIDevice("AM", None, "usb:mock")
+    setup.assert_called_once_with(usb, gpu_bus=bridges, mem_base=0x10000000, pref_mem_base=32 << 30)
+    assert dev.read_config(pci.PCI_VENDOR_ID, 2) == vendor
+    dev.write_config(pci.PCI_COMMAND, 2, 2)
+    assert writes[-1] == (bridges, pci.PCI_COMMAND, 2)

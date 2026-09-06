@@ -90,8 +90,10 @@ class _System:
 
   def pci_setup_usb_bars(self, usb:CustomASM24Controller, gpu_bus:int, mem_base:int, pref_mem_base:int) -> dict[int, tuple[int, int]]:
     for bus in range(gpu_bus):
+      assert usb.pcie_cfg_req(pci.PCI_HEADER_TYPE, bus=bus, dev=0, fn=0, size=1) & 0x7f == pci.PCI_HEADER_TYPE_BRIDGE, \
+        f"Expected PCI bridge at bus {bus}"
       # All 3 values must be written at the same time.
-      buses = (0 << 0) | ((bus+1) << 8) | ((gpu_bus) << 16)
+      buses = bus | ((bus+1) << 8) | (gpu_bus << 16)
       usb.pcie_cfg_req(pci.PCI_PRIMARY_BUS, bus=bus, dev=0, fn=0, value=buses, size=4)
 
       usb.pcie_cfg_req(pci.PCI_MEMORY_BASE, bus=bus, dev=0, fn=0, value=(mem_base>>16) & 0xffff, size=2)
@@ -237,15 +239,21 @@ class USBPCIDevice(PCIDevice):
     usb = USB3(dev)
     if DEBUG >= 1: print(f"am {self.pcibus}: product string: {usb.product!r}")
     self.usb: CustomASM24Controller = CustomASM24Controller(usb)
-    self._bar_info = System.pci_setup_usb_bars(self.usb, gpu_bus=4, mem_base=0x10000000, pref_mem_base=(32 << 30))
+    # Number the point-to-point bridge chain before accessing each downstream device.
+    for self.gpu_bus in range(256):
+      if (header:=self.read_config(pci.PCI_HEADER_TYPE, 1) & pci.PCI_HEADER_TYPE_MASK) == pci.PCI_HEADER_TYPE_NORMAL: break
+      assert header == pci.PCI_HEADER_TYPE_BRIDGE and self.gpu_bus < 255, f"Expected PCI bridge or endpoint at bus {self.gpu_bus}"
+      self.write_config(pci.PCI_PRIMARY_BUS, self.gpu_bus | ((self.gpu_bus+1) << 8) | 0xff0000, 4)
+    assert self.read_config(pci.PCI_VENDOR_ID, 2) not in (0, 0xffff), f"No PCI endpoint at bus {self.gpu_bus}"
+    self._bar_info = System.pci_setup_usb_bars(self.usb, gpu_bus=self.gpu_bus, mem_base=0x10000000, pref_mem_base=(32 << 30))
     self.sram = BumpAllocator(size=0x80000, wrap=False) # asm24 controller sram
 
   def dma_view(self, ctrl_addr, size): return USBMMIOInterface(self.usb, ctrl_addr, size, fmt='B', pcimem=False)
   def alloc_sysmem(self, size:int, vaddr:int=0, contiguous:bool=False) -> tuple[MMIOInterface, list[int]]:
     return self.dma_view(0xf000 + (off:=self.sram.alloc(size)), size), [0x200000 + off]
 
-  def read_config(self, offset:int, size:int): return self.usb.pcie_cfg_req(offset, bus=4, dev=0, fn=0, size=size)
-  def write_config(self, offset:int, value:int, size:int): self.usb.pcie_cfg_req(offset, bus=4, dev=0, fn=0, value=value, size=size)
+  def read_config(self, offset:int, size:int): return self.usb.pcie_cfg_req(offset, bus=self.gpu_bus, dev=0, fn=0, size=size)
+  def write_config(self, offset:int, value:int, size:int): self.usb.pcie_cfg_req(offset, bus=self.gpu_bus, dev=0, fn=0, value=value, size=size)
 
   def bar_info(self, bar_idx:int) -> tuple[int, int]: return self._bar_info[bar_idx]  # type: ignore[override]
   def map_bar(self, bar, off=0, addr=0, size=None, fmt='B'):
