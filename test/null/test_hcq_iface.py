@@ -1,9 +1,9 @@
-import unittest, array, time, ctypes
+import unittest, array, time, struct, ctypes
 from unittest.mock import Mock, patch
 from tinygrad.helpers import mv_address
 from tinygrad.runtime.support.hcq import MMIOInterface
 from tinygrad.runtime.support.system import System
-from tinygrad.runtime.support.usb import USB3, USBMMIOInterface, alloc_cbuffer
+from tinygrad.runtime.support.usb import USB3, USBMMIOInterface, CustomASM24Controller, alloc_cbuffer
 from test.mockgpu.usb import MockUSB
 
 class TestHCQIface(unittest.TestCase):
@@ -131,6 +131,19 @@ class TestUSBPCITransfers(unittest.TestCase):
         if completed == 4: self.assertEqual(bytes(usb.bulk_read(4)), b'abcd')
         else:
           with self.assertRaisesRegex(AssertionError, 'bulk IN short read'): usb.bulk_read(4)
+
+  def test_address_format(self):
+    controller = object.__new__(CustomASM24Controller)
+    controller.usb = Mock()
+    for address, fmt in ((0, 0), (0x10000000, 0), (0xfffffffc, 0), (0x100000000, 0x20), (0x800000000, 0x20)):
+      for write in (False, True):
+        with self.subTest(address=address, write=write):
+          controller.usb.reset_mock()
+          if write: controller.pcie_mem_write(address, b'abcd')
+          else: controller.pcie_mem_read(address, 4)
+          controller.usb.control_write.assert_called_once_with(0xF0, 0xf00 | fmt | (0x40 if write else 0), 1 if write else 2,
+            struct.pack('<III', address & 0xffffffff, address >> 32, 1), 5000)
+
 
 class TestUSBPCIBars(unittest.TestCase):
   def test_resize_all_bars(self):
