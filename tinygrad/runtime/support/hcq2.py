@@ -25,6 +25,7 @@ class HCQInfo:
 
   nargs:int = 0
   table:int = -1
+  error:int = -1
   inputs:tuple[tuple[UOp, str, int], ...] = ()
   slots:tuple[tuple[str, int], ...] = () # per device, the position of its batch slots in the args
   host_deps:tuple[tuple[str, str], ...] = () # (memory owner, accessing device)
@@ -76,6 +77,18 @@ def ccall(fn:Any, *args:UOp|int) -> UOp:
     next(d for d in DTYPES_DICT.values() if d.fmt == fn.restype._type_)
   cargs = [UOp.const(a, dtypes.int) if isinstance(a, int) else a for a in args]
   return UOp.custom_function(fn.__name__, ptr.index(0).load()).call(*cargs, ret_dtype=ret)
+
+def ccheck(value:UOp, expected:UOp|int=0) -> UOp:
+  # C-style CPU submits only: stop before dependent calls or stores when a C int result differs.
+  from tinygrad.renderer.cstyle import CStyleLanguage
+  assert HCQ_RUNTIME_DEV.value.split(':')[0] == "CPU" and isinstance(Device[HCQ_RUNTIME_DEV.value].renderer, CStyleLanguage), \
+    "ccheck requires a C-style CPU renderer"
+  assert value.dtype is dtypes.int32
+  expected = expected.cast(dtypes.int32) if isinstance(expected, UOp) else UOp.const(expected, dtypes.int32)
+  error = UOp.placeholder((2,), dtypes.int32, 0, device=HCQ_RUNTIME_DEV.value, volatile=True, tag="cerror")
+  failed = value.ne(expected)
+  stores = [error.index(UOp.const(i).valid(failed)).store(v) for i, v in enumerate((value, expected))]
+  return UOp(Ops.CUSTOM, src=(failed, *stores), arg=("if ({0}) return;", dtypes.void)).barrier()
 
 CDTYPE = {1: dtypes.uchar, 2: dtypes.ushort, 4: dtypes.uint, 8: dtypes.ulong} # a C field as the unsigned int of its size
 
@@ -424,6 +437,7 @@ def lower_call(call:UOp) -> UOp|None:
   if VIZ: graph_rewrite(sink, PatternMatcher([]), name="View Body")
 
   info = replace(call.arg.aux, nargs=len(bufs), table=bufs.index(table) if table in bufs else -1, inputs=tuple(ctx.inputs),
+                 error=next((i for i, b in enumerate(bufs) if b.tag == "cerror"), -1),
                  slots=tuple((to_tuple(b.device)[0], i) for i, b in enumerate(bufs) if b.tag == "slots"))
   return call.replace(src=(sink, *bufs), arg=replace(call.arg, aux=info)).after(*patches)
 pm_encode = PatternMatcher([(UPat(Ops.CALL, src=(UPat(Ops.SINK),), name="call", allow_any_len=True), lower_call)])

@@ -1,9 +1,12 @@
 import unittest, array, time, struct, ctypes
 from unittest.mock import Mock, patch
+from tinygrad.dtype import dtypes
 from tinygrad.helpers import mv_address
+from tinygrad.uop.ops import UOp, Ops
 from tinygrad.runtime.support.hcq import MMIOInterface
 from tinygrad.runtime.support.system import System
 from tinygrad.runtime.support.usb import USB3, USBMMIOInterface, CustomASM24Controller, alloc_cbuffer
+from tinygrad.runtime.support.nv.usb import usb_stream
 from test.mockgpu.usb import MockUSB
 
 class TestHCQIface(unittest.TestCase):
@@ -165,6 +168,18 @@ class TestUSBPCITransfers(unittest.TestCase):
           controller.usb.control_write.assert_called_once_with(0xF0, 0xf00 | fmt | (0x40 if write else 0), 1 if write else 2,
             struct.pack('<III', address & 0xffffffff, address >> 32, 1), 5000)
 
+  def test_compiled_address_format(self):
+    addr = UOp.variable('usb_addr', 0, (1 << 36)-1, dtypes.uint64)
+    for write in (False, True):
+      with patch('tinygrad.runtime.support.nv.usb._libusb', return_value=UOp(Ops.NOOP)) as call:
+        usb_stream(('NV',), (), addr, UOp.const(0, dtypes.uint64), 4, write)
+      args = call.call_args_list[0].args
+      self.assertEqual((args[2:5], args[6], args[8:]), (('libusb_control_transfer', 0x40, 0xF0), 1 if write else 2, (12, 5000)))
+      for address, fmt in ((0x10000000, 0), (0xfffffffc, 0), (0x100000000, 0x20), (0x800000000, 0x20)):
+        with self.subTest(address=address, write=write):
+          value = args[5].substitute({addr:UOp.const(address, dtypes.uint64)}) if isinstance(args[5], UOp) else args[5]
+          self.assertEqual(int(value), 0xf00 | fmt | (0x40 if write else 0))
+          if isinstance(value, UOp): self.assertEqual(value.dtype, dtypes.int)
 
 class TestUSBPCIBars(unittest.TestCase):
   def test_resize_all_bars(self):

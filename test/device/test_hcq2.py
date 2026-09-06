@@ -1,4 +1,5 @@
 import unittest, contextlib, ctypes, gc, struct, numpy as np
+from dataclasses import replace
 from unittest.mock import patch
 from tinygrad import Device, Tensor, TinyJit, Variable, dtypes, GlobalCounters
 from tinygrad.device import Buffer, Compiled
@@ -8,7 +9,10 @@ from tinygrad.uop.ops import Ops, UOp, UPat, PatternMatcher, KernelInfo
 from tinygrad.engine.realize import compile_linear, link_linear, lower_and_compile, run_linear
 from tinygrad.codegen import do_to_program
 from tinygrad.renderer.cstyle import CStyleLanguage
-from tinygrad.runtime.autogen import libc
+from tinygrad.renderer.llvmir import CPULLVMRenderer
+from tinygrad.renderer import Estimates
+from tinygrad.runtime.autogen import libc, libusb
+from tinygrad.runtime.support.nv.usb import usb_stream
 from tinygrad.runtime.support.c import init_c_struct_t
 import tinygrad.runtime.support.hcq2 as hcq2
 from tinygrad.runtime.support.hcq2 import HCQ_DEVS, all_devices_in, hcq_compile_cache, link_linear_cache
@@ -266,8 +270,14 @@ class TestHCQ2Schedule(unittest.TestCase):
 @unittest.skipUnless(isinstance(Device["CPU"].renderer, CStyleLanguage), "CALL is rendered in C style only")
 class TestHCQ2FFI(unittest.TestCase):
   @staticmethod
-  def _run(body:UOp) -> list[Buffer]:
-    linear = hcq2.hcq_link(lower_and_compile(UOp(Ops.LINEAR, src=(lower_hcq(body),))), allow_cache=False)
+  def _link(body:UOp) -> UOp:
+    call = hcq2.lower_call(UOp.sink(body, arg=KernelInfo("test_ffi")).call(aux=hcq2.HCQInfo(("CPU",))))
+    assert call is not None
+    return hcq2.hcq_link(lower_and_compile(UOp(Ops.LINEAR, src=(call,))), allow_cache=False)
+
+  @classmethod
+  def _run(cls, body:UOp) -> list[Buffer]:
+    linear = cls._link(body)
     run_linear(linear, jit=True)
     return [u.buffer for u in linear.src[0].without_after.src[1:] if u.op is Ops.BUFFER]
 
@@ -295,6 +305,97 @@ class TestHCQ2FFI(unittest.TestCase):
       copied = hcq2.ccall(libc.memcpy, out.index(0), outer.bitcast(dtypes.uint64).index(0).load(), 4)
       bufs = self._run(out.after(copied).index(0).load())
     self.assertEqual(next(b for b in bufs if b.dtype is dtypes.uint32).host.view(fmt='I')[0], 42)
+
+  def test_ffi_ccheck_replay(self):
+    calls = []
+    fn = ctypes.CFUNCTYPE(ctypes.c_int32, ctypes.c_int32)(lambda value: calls.append(value) or value)
+    fn.__module__, fn.__name__ = "tinygrad.runtime.autogen.libc", "test_checked_call"
+    ptr = Buffer("CPU", 1, dtypes.uint64, preallocate=True)
+    ptr.host.view(fmt='Q')[0] = ctypes.cast(fn, ctypes.c_void_p).value
+    value = UOp.variable("ffi_value", -128, 128, dtypes.int32, param=True)
+    expected = UOp.variable("ffi_expected", 0, 128, dtypes.int32, param=True)
+    later = UOp.variable("ffi_later", 0, 128, dtypes.int32, param=True)
+    with Context(HCQ_RUNTIME_DEV="CPU", PROFILE=0, DEBUG=0), patch.object(Device["CPU"].pm_bufferize, "rewrite",
+      side_effect=lambda b, ctx: ptr if b.tag == ("cfunc", "libc", "test_checked_call") else None):
+      first = hcq2.ccheck(hcq2.ccall(fn, value), expected)
+      second = hcq2.ccheck(hcq2.ccall(fn, expected.after(first) + 1), later)
+      out = UOp.placeholder((1,), dtypes.uint32, device="CPU", volatile=True, tag="ffi_marker")
+      linear = self._link(out.after(second).index(0).store(123))
+      call = linear.src[0].without_after
+      self.assertIn(ptr, [u.buffer for u in call.src[1:] if u.op is Ops.BUFFER])
+      info = replace(call.arg.aux, kernels=((("CPU",), "ffi", Estimates(), (0, 1), b""),), slots=(("CPU", call.arg.aux.error),))
+      linear = linear.substitute({call: call.replace(arg=replace(call.arg, aux=info))})
+      error = call.src[1 + info.error].buffer.host.view(fmt='i')
+      marker = next(u.buffer for u in call.src[1:] if u.op is Ops.BUFFER and u.dtype is dtypes.uint32).host.view(fmt='I')
+      with patch.object(Device["CPU"], "synchronize", side_effect=AssertionError("failed calls must not wait for a GPU")) as sync:
+        for got, want, last, wait in ((12, 12, 13, False), (0, 0, 1, False), (-7, 0, 1, False), (3, 4, 5, False), (-7, 0, 1, True),
+                                     (3, 4, 5, True), (12, 12, 14, False), (12, 12, 14, True), (12, 12, 13, False)):
+          with self.subTest(got=got, want=want, last=last, wait=wait):
+            calls.clear()
+            error[0], error[1], marker[0] = -99, 0, 0 # cached replay must clear the previous error, even if this call succeeds
+            pair, vals = (got, want) if got != want else (want + 1, last), {"ffi_value": got, "ffi_expected": want, "ffi_later": last}
+            if pair[0] == pair[1]: run_linear(linear, vals, jit=True, wait=wait)
+            else:
+              with self.assertRaisesRegex(RuntimeError, f"native call returned {pair[0]}, expected {pair[1]}"):
+                run_linear(linear, vals, jit=True, wait=wait)
+            self.assertEqual(calls, [got, want + 1] if got == want else [got])
+            self.assertEqual(marker[0], 123 if pair[0] == pair[1] else 0)
+            self.assertEqual(error[:], [0, 0] if pair[0] == pair[1] else list(pair))
+            sync.assert_not_called()
+
+  def test_ffi_ccheck_requires_cstyle(self):
+    with Context(HCQ_RUNTIME_DEV="CPU"), patch.object(type(Device["CPU"]), "renderer", CPULLVMRenderer.__new__(CPULLVMRenderer)):
+      with self.assertRaisesRegex(AssertionError, "C-style CPU renderer"): hcq2.ccheck(UOp.const(0, dtypes.int32))
+    with Context(HCQ_RUNTIME_DEV="PYTHON"):
+      with self.assertRaisesRegex(AssertionError, "C-style CPU renderer"): hcq2.ccheck(UOp.const(0, dtypes.int32))
+
+  def test_ffi_usb_transfers(self):
+    calls, result = [], {}
+    def control(handle, reqtype, request, value, index, data, length, timeout):
+      calls.append(("control", value, index, ctypes.string_at(data, length)))
+      return result['control'] if len(calls) == 1 else length
+    def bulk(handle, endpoint, data, length, actual, timeout):
+      calls.append(("bulk", endpoint, length, ctypes.string_at(data, length)))
+      actual[0] = result['actual'] if len(calls) == 2 else length
+      if endpoint == 0x81: ctypes.memmove(data, b'ABCDEFGH', min(length, actual[0]))
+      return result['bulk'] if len(calls) == 2 else 0
+    funcs = {fn.__name__: ctypes.CFUNCTYPE(fn.restype, *fn.argtypes)(stub)
+             for fn, stub in ((libusb.libusb_control_transfer, control), (libusb.libusb_bulk_transfer, bulk))}
+    ptrs = {name: Buffer("CPU", 1, dtypes.uint64, preallocate=True) for name in funcs}
+    for name, fn in funcs.items(): ptrs[name].host.view(fmt='Q')[0] = ctypes.cast(fn, ctypes.c_void_p).value
+    addr = UOp.variable('usb_addr', 0, (1 << 36)-1, dtypes.uint64, param=True)
+    with Context(HCQ_RUNTIME_DEV="CPU", DEBUG=0, PROFILE=0), patch.object(Device["CPU"].pm_bufferize, "rewrite",
+      side_effect=lambda b, ctx: ptrs[b.tag[2]] if isinstance(b.tag, tuple) and b.tag[0] == "cfunc" else None):
+      for write in (False, True):
+        payload = UOp.placeholder((8,), dtypes.uint8, device="CPU", volatile=True, tag="usb_payload")
+        first = usb_stream(('CPU',), (), addr, payload.index(0), 8, write)
+        second = usb_stream(('CPU',), (first,), addr + 16, payload.index(0), 4, True)
+        marker = UOp.placeholder((1,), dtypes.uint32, device="CPU", volatile=True, tag="usb_marker")
+        linear = self._link(marker.after(second).index(0).store(123))
+        call = linear.src[0].without_after
+        self.assertGreaterEqual(call.arg.aux.error, 0, "native USB transfers must report errors")
+        bufs = [u.buffer for u in call.src[1:] if u.op is Ops.BUFFER]
+        for ptr in ptrs.values(): self.assertIn(ptr, bufs)
+        data = next(b for b in bufs if b.dtype is dtypes.uint8 and b.size == 8).host
+        done = next(b for b in bufs if b.dtype is dtypes.uint32).host.view(fmt='I')
+        for control_rc, bulk_rc, actual in ((12, 0, 8), (-7, 0, 8), (11, 0, 8), (12, -4, 8), (12, 0, 0), (12, 0, 7), (12, 0, 9), (12, 0, 8)):
+          with self.subTest(write=write, control=control_rc, bulk=bulk_rc, actual=actual):
+            calls.clear()
+            result.update(control=control_rc, bulk=bulk_rc, actual=actual)
+            data[:], done[0] = b'abcdefgh', 0
+            error = (control_rc, 12) if control_rc != 12 else (bulk_rc, 0) if bulk_rc else (actual, 8)
+            if error[0] == error[1]: run_linear(linear, {'usb_addr': 0x800000000}, jit=True, wait=False)
+            else:
+              with self.assertRaisesRegex(RuntimeError, f"native call returned {error[0]}, expected {error[1]}"):
+                run_linear(linear, {'usb_addr': 0x800000000}, jit=True, wait=False)
+            self.assertEqual([c[0] for c in calls], ['control'] if control_rc != 12 else
+                             ['control', 'bulk'] if error[0] != error[1] else ['control', 'bulk', 'control', 'bulk'])
+            self.assertEqual(calls[0], ('control', 0xf20 | (0x40 if write else 0), 1 if write else 2, bytes.fromhex('000000000800000002000000')))
+            self.assertEqual(done[0], 123 if error[0] == error[1] else 0)
+            if error[0] == error[1]:
+              self.assertEqual(calls[2], ('control', 0xf60, 1, bytes.fromhex('100000000800000001000000')))
+              self.assertEqual(calls[-1], ('bulk', 0x02, 4, b'abcd' if write else b'ABCD'))
+
 
 if __name__ == "__main__":
   unittest.main()
