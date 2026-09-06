@@ -103,6 +103,9 @@ class _System:
 
       usb.pcie_cfg_req(pci.PCI_COMMAND, bus=bus, dev=0, fn=0, value=pci.PCI_COMMAND_IO | pci.PCI_COMMAND_MEMORY | pci.PCI_COMMAND_MASTER, size=1)
 
+    cmd = usb.pcie_cfg_req(pci.PCI_COMMAND, bus=gpu_bus, dev=0, fn=0, size=2)
+    usb.pcie_cfg_req(pci.PCI_COMMAND, bus=gpu_bus, dev=0, fn=0, value=cmd & ~pci.PCI_COMMAND_MEMORY, size=2)
+
     # resize all supported BARs
     cap_ptr = 0x100
     while cap_ptr:
