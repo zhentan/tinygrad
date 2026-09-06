@@ -1,7 +1,8 @@
 import unittest, array, time
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from tinygrad.helpers import mv_address
 from tinygrad.runtime.support.hcq import MMIOInterface
+from tinygrad.runtime.support.system import System
 from tinygrad.runtime.support.usb import USBMMIOInterface
 from test.mockgpu.usb import MockUSB
 
@@ -117,6 +118,21 @@ class TestUSBMMIOInterface(unittest.TestCase):
     self.assertIsInstance(raw, bytes)
     self.assertEqual(list(raw), values)
     self.assertEqual(list(usb3.mem[4:8]), values)
+
+class TestUSBPCIBars(unittest.TestCase):
+  def test_resize_all_bars(self):
+    for count in (0, 1, 3):
+      with self.subTest(count=count):
+        config = {0x100:0x20000001, 0x200:0x10015 if count else 0, **{off:1 for off in range(0x10, 0x28, 4)}}
+        entries = [(0x100, 0x400 | (count << 5)), (0xffc00, 0x801), (0x200, 0x503)][:count]
+        for i, (cap, ctrl) in enumerate(entries): config.update({0x204+8*i:cap, 0x208+8*i:ctrl | 0xa5000000})
+        def cfg(offset, bus, dev, fn, size, value=None):
+          self.assertEqual((bus, dev, fn), (0, 0, 0))
+          if value is None: return config.get(offset, 0)
+          config[offset] = value
+        System.pci_setup_usb_bars(Mock(pcie_cfg_req=cfg), gpu_bus=0, mem_base=0x10000000, pref_mem_base=32 << 30)
+        self.assertEqual([config[0x208+8*i] for i in range(count)],
+                         [0xa5000400 | (count << 5), 0xa5000f01, 0xa5000503][:count])
 
 if __name__ == "__main__":
   unittest.main()

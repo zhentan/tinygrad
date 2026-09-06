@@ -103,13 +103,16 @@ class _System:
 
       usb.pcie_cfg_req(pci.PCI_COMMAND, bus=bus, dev=0, fn=0, value=pci.PCI_COMMAND_IO | pci.PCI_COMMAND_MEMORY | pci.PCI_COMMAND_MASTER, size=1)
 
-    # resize bar 0
+    # resize all supported BARs
     cap_ptr = 0x100
     while cap_ptr:
       if pci.PCI_EXT_CAP_ID(hdr:=usb.pcie_cfg_req(cap_ptr, bus=gpu_bus, dev=0, fn=0, size=4)) == pci.PCI_EXT_CAP_ID_REBAR:
-        cap = usb.pcie_cfg_req(cap_ptr + 0x04, bus=gpu_bus, dev=0, fn=0, size=4)
-        new_ctrl = (usb.pcie_cfg_req(cap_ptr + 0x08, bus=gpu_bus, dev=0, fn=0, size=4) & ~0x1F00) | ((int(cap >> 4).bit_length() - 1) << 8)
-        usb.pcie_cfg_req(cap_ptr + 0x08, bus=gpu_bus, dev=0, fn=0, value=new_ctrl, size=4)
+        ctrl = usb.pcie_cfg_req(cap_ptr + 0x08, bus=gpu_bus, dev=0, fn=0, size=4)
+        for i in range((ctrl & pci.PCI_REBAR_CTRL_NBAR_MASK) >> pci.PCI_REBAR_CTRL_NBAR_SHIFT):
+          cap = usb.pcie_cfg_req(cap_ptr + 0x04 + 8*i, bus=gpu_bus, dev=0, fn=0, size=4)
+          ctrl = usb.pcie_cfg_req(cap_ptr + 0x08 + 8*i, bus=gpu_bus, dev=0, fn=0, size=4)
+          new_ctrl = (ctrl & ~0x1F00) | ((int(cap >> 4).bit_length() - 1) << 8)
+          usb.pcie_cfg_req(cap_ptr + 0x08 + 8*i, bus=gpu_bus, dev=0, fn=0, value=new_ctrl, size=4)
 
       cap_ptr = pci.PCI_EXT_CAP_NEXT(hdr)
 
