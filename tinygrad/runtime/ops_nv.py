@@ -799,6 +799,7 @@ class NVDevice(Compiled):
   @functools.cached_property
   def usb_download(self) -> Buffer:
     if not isinstance(self.iface, USBIface): raise RuntimeError("USB DMA staging is only available through USBIface")
+    if OSX: return Buffer("CPU", 512 << 10, dtypes.uint8, preallocate=True)
     return Buffer("CPU", 512 << 10, dtypes.uint8, opaque=self.iface.pci_dev.usb.usb.alloc_dma(512 << 10))
 
   @functools.cached_property

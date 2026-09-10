@@ -143,7 +143,7 @@ class TestNVUSBIface(unittest.TestCase):
     dev.iface = object.__new__(ops_nv.USBIface)
     usb = dev.iface.pci_dev = Mock()
     usb.usb.usb.alloc_dma.return_value = memoryview(bytearray(512 << 10))
-    with patch.object(ops_nv, "Buffer", wraps=Buffer) as allocated:
+    with patch.object(ops_nv, "OSX", False), patch.object(ops_nv, "Buffer", wraps=Buffer) as allocated:
       for _ in range(300):
         b = UOp.placeholder((512 << 10,), dtypes.uint8, device=("NV",), tag=("hcq_host", "usb_download"))
         self.assertIs(nvusb.pm_usb_bufferize.rewrite(b, ctx=dev), dev.usb_download)
@@ -154,6 +154,19 @@ class TestNVUSBIface(unittest.TestCase):
     usb.usb.usb.alloc_dma.assert_called_once_with(512 << 10)
     allocated.assert_called_once_with("CPU", 512 << 10, dtypes.uint8, opaque=usb.usb.usb.alloc_dma.return_value)
 
+  def test_macos_download_staging_owns_cpu_memory_without_libusb_dma(self):
+    dev = object.__new__(ops_nv.NVDevice)
+    dev.iface = object.__new__(ops_nv.USBIface)
+    dev.iface.pci_dev = Mock()
+    dev.iface.pci_dev.usb.usb.alloc_dma.side_effect = RuntimeError("USB DMA allocation failed")
+    with patch.object(ops_nv, "OSX", True), patch.object(ops_nv, "Buffer", wraps=Buffer) as allocated:
+      b = UOp.placeholder((512 << 10,), dtypes.uint8, device=("NV",), tag=("hcq_host", "usb_download"))
+      for _ in range(2): self.assertIs(nvusb.pm_usb_bufferize.rewrite(b, ctx=dev), dev.usb_download)
+      dev.usb_download.host.view(fmt='B')[-1] = 123
+      self.assertEqual(dev.usb_download.host.view(fmt='B')[-1], 123)
+    dev.iface.pci_dev.usb.usb.alloc_dma.assert_not_called()
+    allocated.assert_called_once_with("CPU", 512 << 10, dtypes.uint8, preallocate=True)
+
   def test_dma_staging_survives_wrapper_failure_until_device_cleanup(self):
     dev = object.__new__(ops_nv.NVDevice)
     dev.iface = iface = object.__new__(ops_nv.USBIface)
@@ -162,7 +175,7 @@ class TestNVUSBIface(unittest.TestCase):
     iface.pci_dev, iface.dev_impl = SimpleNamespace(usb=SimpleNamespace(usb=client)), Mock()
     storage = (ctypes.c_ubyte * (512 << 10))()
     ptr = ctypes.cast(storage, ctypes.POINTER(ctypes.c_ubyte))
-    with patch("tinygrad.runtime.support.usb.libusb.libusb_dev_mem_alloc", return_value=ptr), \
+    with patch.object(ops_nv, "OSX", False), patch("tinygrad.runtime.support.usb.libusb.libusb_dev_mem_alloc", return_value=ptr), \
          patch("tinygrad.runtime.support.usb.libusb.libusb_dev_mem_free", return_value=0) as freed, \
          patch.object(ops_nv, "Buffer", side_effect=RuntimeError("CPU buffer failed")):
       with self.assertRaisesRegex(RuntimeError, "CPU buffer failed"): _ = dev.usb_download
