@@ -4,7 +4,8 @@ from tinygrad.dtype import dtypes
 from tinygrad.helpers import mv_address
 from tinygrad.uop.ops import UOp, Ops
 from tinygrad.runtime.support.hcq import MMIOInterface
-from tinygrad.runtime.support.system import System
+from tinygrad.runtime.support.memory import BumpAllocator
+from tinygrad.runtime.support.system import System, USBPCIDevice
 from tinygrad.runtime.support.usb import USB3, USBMMIOInterface, CustomASM24Controller, alloc_cbuffer
 from tinygrad.runtime.support.nv.usb import usb_stream
 from test.mockgpu.usb import MockUSB
@@ -205,6 +206,16 @@ class TestUSBPCIBars(unittest.TestCase):
         System.pci_setup_usb_bars(Mock(pcie_cfg_req=cfg), gpu_bus=0, mem_base=0x10000000, pref_mem_base=32 << 30)
         self.assertEqual([config[0x208+8*i] for i in range(count)],
                          [0xa5000400 | (count << 5), 0xa5000f01, 0xa5000503][:count])
+
+  def test_sysmem_returns_every_page(self):
+    dev = object.__new__(USBPCIDevice)
+    dev.usb, dev.sram = Mock(), BumpAllocator(0x80000, wrap=False)
+    dev.sram.alloc(0x40000)
+
+    view, paddrs = dev.alloc_sysmem(0x3000)
+
+    self.assertEqual((view.addr, view.nbytes), (0x4f000, 0x3000))
+    self.assertEqual(paddrs, [0x240000, 0x241000, 0x242000])
 
 if __name__ == "__main__":
   unittest.main()
