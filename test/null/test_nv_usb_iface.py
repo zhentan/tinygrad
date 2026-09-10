@@ -9,7 +9,8 @@ from tinygrad.helpers import Context
 from tinygrad.runtime import ops_nv
 from tinygrad.runtime.support import hcq2
 from tinygrad.runtime.support.memory import AddrSpace
-from tinygrad.runtime.support.usb import USB3
+from tinygrad.runtime.support.system import System
+from tinygrad.runtime.support.usb import USB3, USBMMIOInterface
 from tinygrad.runtime.support.nv.usb import pm_usb_hostio, pm_usb_stage, usb_stage_copy
 from tinygrad.runtime.support.nv import usb as nvusb
 from tinygrad.uop.ops import Ops, PatternMatcher, UOp, graph_rewrite
@@ -368,11 +369,12 @@ class TestNVUSBIface(unittest.TestCase):
     usb_device, pci_device, nvdev = object(), Mock(), Mock()
     with patch.object(ops_nv.USB3, "list_devices", return_value=[(usb_device, "usb:4-3")]) as listed, \
          patch.object(ops_nv, "USBPCIDevice", return_value=pci_device) as opened, \
-         patch.object(ops_nv.System, "reserve_va") as reserved, patch.object(ops_nv, "NVNativeDev", return_value=nvdev):
+         patch.object(System, "reserve_va", side_effect=OSError("host reservation unavailable")) as reserved, \
+         patch.object(ops_nv, "NVNativeDev", return_value=nvdev):
       iface = usb_iface(Mock(), 0)
     listed.assert_called_once_with(0x3801, 0x0001)
     opened.assert_called_once_with("NV", usb_device, "usb:4-3")
-    reserved.assert_called_once_with(ops_nv.NVMemoryManager.va_allocator.base, ops_nv.NVMemoryManager.va_allocator.size)
+    reserved.assert_not_called()
     self.assertIs(iface.pci_dev, pci_device)
     self.assertIs(iface.dev_impl, nvdev)
     self.assertEqual((iface.vram_bar, iface.count), (1, 1))
@@ -384,11 +386,35 @@ class TestNVUSBIface(unittest.TestCase):
     self.assertIsNotNone(usb_iface)
     pci_device = Mock()
     with patch.object(ops_nv.USB3, "list_devices", return_value=[(object(), "usb:4-3")]), \
-         patch.object(ops_nv, "USBPCIDevice", return_value=pci_device), patch.object(ops_nv.System, "reserve_va"), \
+         patch.object(ops_nv, "USBPCIDevice", return_value=pci_device), patch.object(System, "reserve_va"), \
          patch.object(ops_nv, "NVNativeDev", side_effect=RuntimeError("native bootstrap failed")):
       with self.assertRaisesRegex(RuntimeError, "native bootstrap failed"):
         usb_iface(Mock(), 0)
     pci_device.reset.assert_called_once_with()
+
+  def test_usb_memory_views_are_not_host_mappings(self):
+    iface = object.__new__(ops_nv.USBIface)
+    iface._setup_native_nv()
+    iface.vram_bar, iface.pci_dev, iface.dev_impl = 1, Mock(), SimpleNamespace(mm=Mock())
+    iface.pci_dev.bar_info.return_value = (0, 1 << 30)
+    va, size = 0x1000000000, 0x4000
+    iface.dev_impl.mm.alloc_vaddr.return_value = va
+    for sram, usb in ((False, False), (False, True), (True, False), (True, True)):
+      with self.subTest(sram=sram, usb=usb):
+        view = USBMMIOInterface(Mock(), 0x240000, size, 'B') if usb else ops_nv.MMIOInterface(va, size)
+        iface.pci_dev.map_bar.return_value = view
+        iface.pci_dev.alloc_sysmem.return_value = (view, [0x240000, 0x241000, 0x242000, 0x243000])
+        mapping = SimpleNamespace(va_addr=va, size=size, paddrs=[(0x240000, size)], aspace=AddrSpace.SYS if sram else AddrSpace.PHYS)
+        iface.dev_impl.mm.valloc.return_value = iface.dev_impl.mm.map_range.return_value = mapping
+        with patch.object(ops_nv.FileIOInterface, 'anon_mmap', side_effect=AssertionError('USB must not map host memory')) as mapped, \
+             patch.object(ops_nv.FileIOInterface, 'munmap') as unmapped:
+          storage = iface.alloc_usb_sram(size) if sram else iface.alloc(size, cpu_access=True)
+          self.assertIs(storage.host, view)
+          self.assertEqual(storage.meta.has_cpu_mapping, not usb)
+          iface.free(storage)
+        mapped.assert_not_called()
+        if usb: unmapped.assert_not_called()
+        else: unmapped.assert_called_once_with(va, size)
 
   def test_native_usb_allocates_logical_rm_prerequisites(self):
     iface = object.__new__(ops_nv.USBIface)

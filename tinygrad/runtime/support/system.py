@@ -341,11 +341,12 @@ class PCIIfaceBase:
       vaddr = self.dev_impl.mm.alloc_vaddr(size:=round_up(size, mmap.PAGESIZE), align=mmap.PAGESIZE)
       memview, paddrs = self.pci_dev.alloc_sysmem(size, vaddr=vaddr, contiguous=contiguous)
       mapping = self.dev_impl.mm.map_range(vaddr, size, [(paddr, 0x1000) for paddr in paddrs], aspace=AddrSpace.SYS, snooped=True, uncached=True)
-      return BufferStorage(vaddr, PCIAllocationMeta(mapping, has_cpu_mapping=True, hMemory=paddrs[0]), memview)
+      return BufferStorage(vaddr, PCIAllocationMeta(mapping, has_cpu_mapping=not isinstance(memview, USBMMIOInterface), hMemory=paddrs[0]), memview)
 
     mapping = self.dev_impl.mm.valloc(size:=round_up(size, 0x1000), uncached=uncached, contiguous=cpu_access, zero=zero)
     barview = self.pci_dev.map_bar(bar=self.vram_bar, off=mapping.paddrs[0][0], size=mapping.size) if cpu_access else None
-    return BufferStorage(mapping.va_addr, PCIAllocationMeta(mapping, cpu_access, hMemory=mapping.paddrs[0][0]), barview)
+    return BufferStorage(mapping.va_addr,
+                         PCIAllocationMeta(mapping, cpu_access and not isinstance(barview, USBMMIOInterface), hMemory=mapping.paddrs[0][0]), barview)
 
   def free(self, storage:BufferStorage):
     if storage.meta.mapping.aspace is AddrSpace.PHYS: self.dev_impl.mm.vfree(storage.meta.mapping)

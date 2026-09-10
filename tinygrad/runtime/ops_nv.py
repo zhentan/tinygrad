@@ -17,7 +17,7 @@ from tinygrad.renderer.cstyle import CUDARenderer, NVCCRenderer
 from tinygrad.runtime.autogen import nv_570, nv_580, nv_610, mesa
 from tinygrad.runtime.support.elf import elf_loader
 from tinygrad.runtime.support.nv.nvdev import NVDev, NVNativeDev, NVMemoryManager
-from tinygrad.runtime.support.system import System, PCIIfaceBase, USBPCIDevice, PCIAllocationMeta, MAP_FIXED
+from tinygrad.runtime.support.system import PCIIfaceBase, USBPCIDevice, PCIAllocationMeta, MAP_FIXED
 from tinygrad.runtime.support.memory import AddrSpace
 from tinygrad.runtime.support.usb import USB3
 from tinygrad.runtime.support.nv.usb import pm_usb_stage, pm_usb_hostio, pm_usb_bufferize, usb_stream, usb_address
@@ -596,7 +596,6 @@ class USBIface(PCIIface):
     if NVKIface.root is not None: raise RuntimeError("Cannot use USBIface after NVKIface has been initialized (would corrupt UVM memory)")
     if dev_id >= len(visible:=hcq_filter_visible_devices(USB3.list_devices(0x3801, 0x0001), "NV")):
       raise RuntimeError(f"NV:{dev_id} does not exist ({len(visible)} devices available)")
-    System.reserve_va(NVMemoryManager.va_allocator.base, NVMemoryManager.va_allocator.size)
     self.dev, self.pci_dev, self.vram_bar, self.count = dev, USBPCIDevice("NV", *visible[dev_id]), 1, len(visible)
     try:
       self.dev_impl = NVNativeDev(self.pci_dev)
