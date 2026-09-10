@@ -1,13 +1,18 @@
 import unittest, array, time, struct, ctypes
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 from tinygrad.dtype import dtypes
 from tinygrad.helpers import mv_address
-from tinygrad.uop.ops import UOp, Ops
+from tinygrad.uop.ops import UOp, Ops, KernelInfo, graph_rewrite
+from tinygrad.device import Device
+from tinygrad.runtime.support import hcq2
 from tinygrad.runtime.support.hcq import MMIOInterface
 from tinygrad.runtime.support.memory import BumpAllocator
 from tinygrad.runtime.support.system import System, USBPCIDevice
-from tinygrad.runtime.support.usb import USB3, USBMMIOInterface, CustomASM24Controller, alloc_cbuffer
-from tinygrad.runtime.support.nv.usb import usb_stream
+from tinygrad.runtime.support.usb import USB3, USBMMIOInterface, CustomASM24Controller
+from tinygrad.runtime.support.nv.usb import usb_stream, usb_scsi, usb_stage_copy
+from tinygrad.runtime.support.usb import alloc_cbuffer
+from tinygrad.runtime.support.nv.usb import pm_usb_stage, pm_usb_hostio
 from test.mockgpu.usb import MockUSB
 
 class TestHCQIface(unittest.TestCase):
@@ -124,6 +129,133 @@ class TestUSBMMIOInterface(unittest.TestCase):
     self.assertEqual(list(usb3.mem[4:8]), values)
 
 class TestUSBPCITransfers(unittest.TestCase):
+  def test_copyout_waits_before_direct_pcie_read(self):
+    view = SimpleNamespace(addr=0x4f000)
+    window = Mock(device="NV", dtype=dtypes.uint8, size=0x40000)
+    window.host = view
+    reset, submitted, waited = (UOp.custom_function(x) for x in ("test_usb_reset", "test_usb_submit", "test_usb_wait"))
+    seen = {}
+
+    def write_one(base, offset, deps, devs, idx, value):
+      seen["reset"] = (base, offset, deps, devs, idx, value)
+      return reset
+    def submit(*cmds, devs, queue):
+      seen["submit"] = (cmds, devs, queue)
+      return submitted
+    def wait_value(base, value, deps):
+      seen["wait"] = (base, value, deps)
+      return waited
+    def stream(devs, deps, addr, data, nbytes, write):
+      seen["stream"] = (devs, deps, addr, data, nbytes, write)
+      return UOp.custom_function("test_usb_stream", *deps)
+
+    with patch('tinygrad.runtime.support.nv.usb.Device') as device, \
+         patch('tinygrad.runtime.support.nv.usb.usb_scsi', side_effect=AssertionError("copyout must not arm F2")), \
+         patch('tinygrad.runtime.support.nv.usb.usb_write_one', side_effect=write_one), \
+         patch('tinygrad.runtime.support.nv.usb.make_submit', side_effect=submit), \
+         patch('tinygrad.runtime.support.nv.usb.usb_wait_value', side_effect=wait_value), \
+         patch('tinygrad.runtime.support.nv.usb.usb_stream', side_effect=stream):
+      device.__getitem__.return_value.pm_stage_copy = pm_usb_stage
+      device.__getitem__.return_value.usb_readback = window
+      usb_stage_copy(UOp.placeholder((0x1000,), dtypes.uint8, device="CPU"),
+                     UOp.placeholder((0x1000,), dtypes.uint8, device="NV"))
+
+    done, offset, deps, reset_devs, idx, value = seen["reset"]
+    self.assertEqual((done.tag, done.dtype, offset, deps, reset_devs, idx.val, value.val),
+                     ("usb_readback_done", dtypes.uint64, 0, (), ("NV",), 0, 0))
+    cmds, devs, queue = seen["submit"]
+    self.assertEqual((devs, queue), (("NV",), "COPY:0"))
+    self.assertEqual(len(cmds), 3)
+    self.assertEqual((cmds[0].op, cmds[0].arg), (Ops.INS, ("wait", dtypes.void)))
+    self.assertIs(cmds[0].src[0], hcq2.timeline(("NV",)))
+    self.assertIs(cmds[0].src[1], hcq2.timeline_value(("NV",)))
+    self.assertIs(cmds[1].op, Ops.CALL)
+    self.assertEqual((cmds[2].arg, cmds[2].src[0].tag, cmds[2].src[1].val),
+                     (("store", dtypes.void), "usb_readback_done", 1))
+    waited_done, waited_value, waited_deps = seen["wait"]
+    self.assertIs(waited_done, done)
+    self.assertEqual(waited_value, 1)
+    self.assertEqual(waited_deps[0].src, (submitted, reset))
+    stream_devs, stream_deps, _, _, nbytes, write = seen["stream"]
+    self.assertEqual((stream_devs, stream_deps, nbytes, write), (("NV",), (waited,), 0x1000, False))
+
+  def test_staging_uses_lowerable_hcq_calls(self):
+    view = SimpleNamespace(addr=0x4f000)
+    window = Mock(device="NV", dtype=dtypes.uint8, size=0x40000)
+    window.host = view
+    for src_device, dst_device, name in (("CPU", "NV", "hcq_copyin"), ("PYTHON", "NV", "hcq_copyin"),
+                                         ("NV", "CPU", "hcq_copyout"), ("NV", "PYTHON", "hcq_copyout")):
+      with self.subTest(name=name), patch('tinygrad.runtime.support.nv.usb.Device') as device:
+        device.__getitem__.return_value.pm_stage_copy = pm_usb_stage
+        device.__getitem__.return_value.usb_sram = window
+        device.__getitem__.return_value.usb_readback = window
+        staged = usb_stage_copy(UOp.placeholder((0x1000,), dtypes.uint8, device=dst_device),
+                                UOp.placeholder((0x1000,), dtypes.uint8, device=src_device))
+      calls = [u for u in staged.src if u.op is Ops.CALL and u.arg.name == name]
+      self.assertEqual(len(calls), 1)
+      self.assertIs(calls[0].src[0].op, Ops.SINK)
+      self.assertEqual(calls[0].src[0].arg, KernelInfo(name))
+      self.assertFalse(any(u.op is Ops.BUFFER and u.device == "CPU" for u in calls[0].src[0].toposort()))
+      if src_device == "PYTHON":
+        copies = [u for u in staged.toposort() if u.op is Ops.CALL and u.src[0].op is Ops.COPY]
+        self.assertIn(("CPU", "PYTHON"), [(u.src[1].device, u.src[2].device) for u in copies])
+
+  def test_hcq_compile_stages_native_usb_copies_before_batching(self):
+    # Prime the matcher before mocking devices, as an earlier CPU test would.
+    warm_dst, warm_src = (UOp.placeholder((16,), dtypes.uint8, device=d) for d in ("CPU", "PYTHON"))
+    hcq2.hcq_compile(UOp(Ops.LINEAR, src=(warm_src.copy_to_device("CPU").call(warm_dst, warm_src),)), None, False)
+    window = Mock(device="NV", dtype=dtypes.uint8, size=0x40000, host=SimpleNamespace(addr=0x4f000))
+    devices = {"NV": SimpleNamespace(pm_stage_copy=pm_usb_stage, usb_sram=window, usb_readback=window,
+                                    has_copy_queue=True), "CPU": Device["CPU"]}
+    for src_device, dst_device, name in (("CPU", "NV", "hcq_copyin"), ("NV", "CPU", "hcq_copyout")):
+      # Compiled matchers retain their globals, so patch lookup on the original Device object.
+      with self.subTest(name=name), patch.object(type(Device), "__getitem__", lambda _, device: devices[device]), \
+           patch.object(hcq2, "sched_batches", return_value=UOp(Ops.LINEAR)) as batch, patch.dict(hcq2.hcq_compile_cache, clear=True):
+        for _ in range(2):
+          # New inputs of the same shape must reuse the staged template.
+          dst, src = (UOp.from_buffer(Mock(device=d, dtype=dtypes.uint8, size=0x1000)) for d in (dst_device, src_device))
+          hcq2.hcq_compile(UOp(Ops.LINEAR, src=(src.copy_to_device(dst.device).call(dst, src),)), [], False, cache=True)
+        self.assertEqual(batch.call_count, 1)
+      calls = batch.call_args.args[0].src
+      self.assertEqual(sum(c.op is Ops.CALL and c.arg.name == name for c in calls), 1)
+      for call in calls:
+        if call.op is Ops.CALL and call.src[0].op is Ops.COPY:
+          self.assertEqual(call.src[1].device, call.src[2].device)
+
+  def test_compiled_scsi_uses_staging_slot(self):
+    for read in (False, True):
+      with self.subTest(read=read), patch('tinygrad.runtime.support.nv.usb._libusb', return_value=UOp(Ops.NOOP)) as call:
+        usb_scsi(('NV',), read, 0x1000, slot_start=16)
+      args = call.call_args.args
+      self.assertEqual((args[2:7], args[8:]),
+                       (('libusb_control_transfer', 0x40, 0xF2, 8 | (0x8000 if read else 0), 0x110), (0, 1000)))
+
+  def test_hcq_hostio_mediates_device_params(self):
+    buf = UOp.placeholder((4,), dtypes.uint64, device=("NV",), tag="ring_compute_0")
+    cases = (buf, buf.after(UOp(Ops.NOOP)), buf.after(UOp(Ops.NOOP)).after(UOp(Ops.NOOP)),
+             buf.after(UOp(Ops.NOOP))[1:2].bitcast(dtypes.uint32))
+    for depth, based in enumerate(cases):
+      load = based.index(0).load()
+      store = based.index(0).store(UOp.const(0x1234, based.dtype))
+      for op in (load, store):
+        with self.subTest(depth=depth, op=op.op):
+          rewritten = graph_rewrite(op, pm_usb_hostio, walk=True)
+          self.assertIsNot(rewritten, op)
+          self.assertTrue(any(u.op is Ops.CUSTOM_FUNCTION and str(u.arg).startswith("libusb_") for u in rewritten.toposort()))
+
+    cpu = UOp.placeholder((1,), dtypes.uint64, device="CPU", tag="host")
+    host_load = cpu.index(0).load()
+    self.assertIs(graph_rewrite(host_load, pm_usb_hostio, walk=True), host_load)
+
+  def test_hcq_hostio_scalarizes_scatter(self):
+    buf = UOp.placeholder((8,), dtypes.uint32, device=("NV",), tag="cmdbuf_copy_0")
+    indices = UOp.stack(*[UOp.const(i, dtypes.int) for i in (1, 3, 5, 7)])
+    values = UOp.stack(*[UOp.const(i, dtypes.uint32) for i in (10, 30, 50, 70)])
+    rewritten = graph_rewrite(buf.index(indices).store(values), pm_usb_hostio, walk=True)
+    bulk_calls = [u for u in rewritten.toposort() if u.op is Ops.CALL and u.src[0].op is Ops.CUSTOM_FUNCTION
+                  and u.src[0].arg == "libusb_bulk_transfer"]
+    self.assertEqual(len(bulk_calls), 4)
+
   def test_xdata_bounds(self):
     controller = object.__new__(CustomASM24Controller)
     controller.usb = Mock()
@@ -156,6 +288,40 @@ class TestUSBPCITransfers(unittest.TestCase):
         if completed == 4: self.assertEqual(bytes(usb.bulk_read(4)), b'abcd')
         else:
           with self.assertRaisesRegex(AssertionError, 'bulk IN short read'): usb.bulk_read(4)
+
+  def test_bulk_write_chunks_payload_to_reusable_buffer(self):
+    usb = object.__new__(USB3)
+    usb.handle = None
+    usb._bulk_buf, usb._bulk_mv = alloc_cbuffer(4)
+    usb._transferred = ctypes.c_int(0)
+    chunks = []
+    def transfer(_handle, endpoint, data, length, transferred, timeout):
+      self.assertEqual((endpoint, timeout), (0x02, 1234))
+      chunks.append(bytes(data[:length]))
+      transferred.value = length
+      return 0
+
+    with patch('tinygrad.runtime.support.usb.libusb.libusb_bulk_transfer', side_effect=transfer):
+      usb.bulk_write(b'abcdefghij', timeout=1234)
+
+    self.assertEqual(chunks, [b'abcd', b'efgh', b'ij'])
+
+  def test_bulk_write_bounds_each_transfer(self):
+    usb = object.__new__(USB3)
+    usb.handle = None
+    size = (256 << 10) + 4
+    usb._bulk_buf, usb._bulk_mv = alloc_cbuffer(size)
+    usb._transferred = ctypes.c_int(0)
+    lengths = []
+    def transfer(_handle, _endpoint, _data, length, transferred, _timeout):
+      lengths.append(length)
+      transferred.value = length
+      return 0
+
+    with patch('tinygrad.runtime.support.usb.libusb.libusb_bulk_transfer', side_effect=transfer):
+      usb.bulk_write(bytes(size))
+
+    self.assertEqual(lengths, [256 << 10, 4])
 
   def test_address_format(self):
     controller = object.__new__(CustomASM24Controller)
@@ -192,41 +358,17 @@ class TestUSBPCITransfers(unittest.TestCase):
           else: controller.pcie_mem_read(0xfffffffc, 8)
         self.assertEqual(controller.usb.mock_calls, [])
 
-  def test_bulk_write_chunks_payload_to_reusable_buffer(self):
-    usb = object.__new__(USB3)
-    usb.handle = None
-    usb._bulk_buf, usb._bulk_mv = alloc_cbuffer(4)
-    usb._transferred = ctypes.c_int(0)
-    chunks = []
-    def transfer(_handle, endpoint, data, length, transferred, timeout):
-      self.assertEqual((endpoint, timeout), (0x02, 1234))
-      chunks.append(bytes(data[:length]))
-      transferred.value = length
-      return 0
-
-    with patch('tinygrad.runtime.support.usb.libusb.libusb_bulk_transfer', side_effect=transfer):
-      usb.bulk_write(b'abcdefghij', timeout=1234)
-
-    self.assertEqual(chunks, [b'abcd', b'efgh', b'ij'])
-
-  def test_bulk_write_bounds_each_transfer(self):
-    usb = object.__new__(USB3)
-    usb.handle = None
-    size = (256 << 10) + 4
-    usb._bulk_buf, usb._bulk_mv = alloc_cbuffer(size)
-    usb._transferred = ctypes.c_int(0)
-    lengths = []
-    def transfer(_handle, _endpoint, _data, length, transferred, _timeout):
-      lengths.append(length)
-      transferred.value = length
-      return 0
-
-    with patch('tinygrad.runtime.support.usb.libusb.libusb_bulk_transfer', side_effect=transfer):
-      usb.bulk_write(bytes(size))
-
-    self.assertEqual(lengths, [256 << 10, 4])
-
 class TestUSBPCIBars(unittest.TestCase):
+  def test_sysmem_returns_every_page(self):
+    dev = object.__new__(USBPCIDevice)
+    dev.usb, dev.sram = Mock(), BumpAllocator(0x80000, wrap=False)
+    dev.sram.alloc(0x40000)
+
+    view, paddrs = dev.alloc_sysmem(0x3000)
+
+    self.assertEqual((view.addr, view.nbytes), (0x4f000, 0x3000))
+    self.assertEqual(paddrs, [0x240000, 0x241000, 0x242000])
+
   def test_resize_all_bars(self):
     for count in (0, 1, 3):
       with self.subTest(count=count):
@@ -240,16 +382,6 @@ class TestUSBPCIBars(unittest.TestCase):
         System.pci_setup_usb_bars(Mock(pcie_cfg_req=cfg), gpu_bus=0, mem_base=0x10000000, pref_mem_base=32 << 30)
         self.assertEqual([config[0x208+8*i] for i in range(count)],
                          [0xa5000400 | (count << 5), 0xa5000f01, 0xa5000503][:count])
-
-  def test_sysmem_returns_every_page(self):
-    dev = object.__new__(USBPCIDevice)
-    dev.usb, dev.sram = Mock(), BumpAllocator(0x80000, wrap=False)
-    dev.sram.alloc(0x40000)
-
-    view, paddrs = dev.alloc_sysmem(0x3000)
-
-    self.assertEqual((view.addr, view.nbytes), (0x4f000, 0x3000))
-    self.assertEqual(paddrs, [0x240000, 0x241000, 0x242000])
 
 if __name__ == "__main__":
   unittest.main()

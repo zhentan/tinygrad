@@ -1,6 +1,6 @@
 import unittest, contextlib, ctypes, gc, struct, numpy as np
 from dataclasses import replace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from tinygrad import Device, Tensor, TinyJit, Variable, dtypes, GlobalCounters
 from tinygrad.device import Buffer, Compiled
 from tinygrad.dtype import AddrSpace
@@ -12,8 +12,8 @@ from tinygrad.renderer.cstyle import CStyleLanguage
 from tinygrad.renderer.llvmir import CPULLVMRenderer
 from tinygrad.renderer import Estimates
 from tinygrad.runtime.autogen import libc, libusb
-from tinygrad.runtime.support.nv.usb import usb_stream
-from tinygrad.runtime.support.usb import USBMMIOInterface
+from tinygrad.runtime.support.usb import USBMMIOInterface, CustomASM24Controller
+from tinygrad.runtime.support.nv.usb import usb_stream, usb_write_one, usb_idle
 from tinygrad.runtime.support.c import init_c_struct_t
 import tinygrad.runtime.support.hcq2 as hcq2
 from tinygrad.runtime.support.hcq2 import HCQ_DEVS, all_devices_in, hcq_compile_cache, link_linear_cache
@@ -270,6 +270,45 @@ class TestHCQ2Schedule(unittest.TestCase):
       self.assertEqual(outer_buf.host.view(fmt='Q')[0], inner_buf._buf + 4)
 
 class TestHCQ2Link(unittest.TestCase):
+  def test_post_encode_rewrites_callback_output(self):
+    emitted = UOp.placeholder((1,), dtypes.uint32, device="CPU", tag="emitted")
+    encode = PatternMatcher([(UPat(Ops.CUSTOM_FUNCTION, arg="emit"), lambda emitted=emitted: emitted.index(0).load())])
+    post = PatternMatcher([(UPat(Ops.LOAD, src=(UPat(Ops.INDEX),)), lambda: UOp.const(7, dtypes.uint32))])
+    body = UOp.custom_function("emit")
+    with patch.object(Device["CPU"], "pm_encode", encode), patch.object(Device["CPU"], "pm_lower", post):
+      call = hcq2.lower_call(UOp.sink(body, arg=KernelInfo("test_post_encode")).call(aux=hcq2.HCQInfo(("CPU",))))
+    assert call is not None
+    self.assertEqual(call.without_after.arg.aux.nargs, 0)
+
+  def test_single_link_word(self):
+    buf, word = Buffer("CPU", 1, dtypes.uint64, preallocate=True), 0x12345678
+    uop = UOp.from_buffer(buf)
+    store = uop.index(UOp.const(0, dtypes.int)).store(UOp.const(word, dtypes.uint32).cast(dtypes.uint64))
+    hcq2.hcq_link(UOp(Ops.LINEAR, src=(uop.after(store),)), allow_cache=False)
+    self.assertEqual(buf.host.view(fmt='Q')[0], word)
+
+  def test_usb_link_subdword_patch_preserves_neighboring_bytes(self):
+    for address in (0x10000000, 0x800000000):
+      for offset in (1, 2, 3, 132):
+        with self.subTest(address=address, offset=offset):
+          memory = bytearray([0xA5] * 256)
+          controller = object.__new__(CustomASM24Controller)
+          def control(request, value, mode, data, timeout):
+            self.assertEqual((request, value & 0xFF, mode, timeout), (0xF0, 0x60 if address >> 32 else 0x40, 0, 5000))
+            target, payload = struct.unpack('<QI', data)
+            self.assertEqual(target & 3, 0)
+            self.assertTrue(0 < (value >> 8) <= 15)
+            for lane in range(4):
+              if value >> (8 + lane) & 1: memory[target - address + lane] = payload >> (8 * lane) & 0xFF
+          controller.usb = Mock(spec=['control_write'], control_write=control)
+          buf = Buffer("CPU", 256, dtypes.uint8, preallocate=True)
+          with patch.object(buf, "_storage", replace(buf.get_storage(), host=USBMMIOInterface(controller, address, 256, "B"))):
+            patched = hcq2.patch(UOp.from_buffer(buf), [(offset, UOp.const(0xBEEF, dtypes.uint16))])
+            hcq2.hcq_link(UOp(Ops.LINEAR, src=(patched,)), allow_cache=False)
+          expected = bytearray([0xA5] * 256)
+          expected[offset:offset + 2] = b'\xef\xbe'
+          self.assertEqual(memory, expected)
+
   def test_failed_binary_upload_is_not_cached(self):
     for previous, restore_previous in ((None, False), (b'old!', False), (b'old!', True)):
       with self.subTest(previous=previous, restore_previous=restore_previous):
@@ -313,6 +352,72 @@ class TestHCQ2FFI(unittest.TestCase):
       out = cpu_buf(dtype=dtypes.int32, slot=1, volatile=True, tag="ffi_result")
       bufs = self._run(out.index(0).store(hcq2.ccall(libc.dll.ffs, 0x10)))
     self.assertEqual(next(b for b in bufs if b.dtype is dtypes.int).host.view(fmt='i')[0], 5)
+
+  def test_fence_preserves_preincrement_timeline_snapshot(self):
+    with Context(HCQ_RUNTIME_DEV="CPU", DEBUG=0, PROFILE=0):
+      tl = hcq2.timeline(("CPU",))
+      slots = cpu_buf(dtype=dtypes.uint64, volatile=True, tag="fence_slots")
+      out = cpu_buf(2, dtype=dtypes.uint64, volatile=True, tag="fence_values")
+      fence = UOp.custom_function("hcq_fence", slots)
+      waited = out.after(fence).index(0).store(hcq2.timeline_value(("CPU",)))
+      signaled = out.after(waited).index(1).store(hcq2.timeline_value(("CPU",)) + UOp.const(1, dtypes.uint64))
+      body = tl.after(signaled).index(0).store(hcq2.timeline_value(("CPU",)) + UOp.const(1, dtypes.uint64))
+      timeline = Buffer("CPU", 2, dtypes.uint64, preallocate=True)
+      timeline.host.view(fmt='Q')[0] = timeline.host.view(fmt='Q')[1] = 7
+      with patch.object(Device["CPU"], "timeline", timeline):
+        linear = self._link(body)
+        run_linear(linear, jit=True)
+      result = next(u.buffer for u in linear.src[0].without_after.src[1:] if u.op is Ops.BUFFER and u.buffer.size == 2 and u.buffer is not timeline)
+      self.assertEqual(result.host.view(fmt='Q')[:], [7, 8])
+      self.assertEqual(timeline.host.view(fmt='Q')[:], [8, 8])
+
+  def test_usb_idle_links_device_timeline(self):
+    with Context(HCQ_RUNTIME_DEV="CPU", DEBUG=0, PROFILE=0):
+      timeline = Buffer("CPU", 2, dtypes.uint64, preallocate=True)
+      timeline.host.view(fmt='Q')[0] = timeline.host.view(fmt='Q')[1] = 7
+      # Replace the USB read with a local read, retaining the real placeholder binding and compiled wait.
+      with patch.object(Device["CPU"], "timeline", timeline), \
+           patch("tinygrad.runtime.support.nv.usb.usb_load", side_effect=lambda b, idx, dt: b.index(idx).load()):
+        marker = cpu_buf(dtype=dtypes.uint32, volatile=True, tag="idle_marker")
+        linear = self._link(marker.after(usb_idle(("CPU",))).index(0).store(123))
+      bufs = [u.buffer for u in linear.src[0].without_after.src[1:] if u.op is Ops.BUFFER]
+      self.assertIn(timeline, bufs, "USB idle must wait on the device timeline, not an unrelated allocation")
+      run_linear(linear, jit=True)
+      self.assertEqual(next(b for b in bufs if b.dtype is dtypes.uint32).host.view(fmt='I')[0], 123)
+
+  def test_hcq_call_accepts_buffer_view_args(self):
+    with Context(HCQ_RUNTIME_DEV="CPU"):
+      source = Buffer("CPU", 4, dtypes.uint32, preallocate=True)
+      source.host.view(fmt='I')[1] = 123
+      view = UOp.from_buffer(source)[1:3]
+      out = cpu_buf(dtype=dtypes.uint32, volatile=True, tag="view_result")
+      body = UOp.sink(out.index(0).store(view.index(0).load()), arg=KernelInfo("view_arg"))
+      call = hcq2.lower_call(body.call(view, aux=hcq2.HCQInfo(("CPU",))))
+      linear = hcq2.hcq_link(lower_and_compile(UOp(Ops.LINEAR, src=(call,))), allow_cache=False)
+      run_linear(linear, jit=True)
+      result = next(u.buffer for u in linear.src[0].without_after.src[1:] if u.buffer.size == 1)
+      self.assertEqual(result.host.view(fmt='I')[0], 123)
+
+  def test_getaddr_with_runtime_dependency_stays_in_submitter(self):
+    for runtime in ("CPU", "PYTHON"):
+      with self.subTest(runtime=runtime), Context(HCQ_RUNTIME_DEV=runtime, DEBUG=0, PROFILE=0):
+        source = UOp.placeholder((2,), dtypes.uint32, device="CPU", volatile=True, tag="runtime_source")
+        marker = UOp.placeholder((3,), dtypes.uint32, device="CPU", volatile=True, tag="runtime_marker")
+        program = UOp.placeholder((5,), dtypes.uint8, device="CPU", tag="program")
+        dependent = program.after(marker.index(0).store(source.index(0).load()))
+        word = hcq2.patch(UOp.placeholder((1,), dtypes.uint64, device="CPU", volatile=True, tag="link_word"),
+                          [(0, dependent.getaddr(("CPU",)))])
+        linear = self._link(word.index(0).load())
+        bufs = [u.buffer for u in linear.src[0].without_after.src[1:] if u.op is Ops.BUFFER]
+        source_buf = next(b for b in bufs if b.dtype is dtypes.uint32 and b.size == 2)
+        marker_buf = next(b for b in bufs if b.dtype is dtypes.uint32 and b.size == 3)
+        program_buf = next(u.buffer for u in linear.src[0].src[1:]
+                           if u.op is Ops.BUFFER and u.dtype is dtypes.uint8 and u.buffer.size == 5)
+        source_buf.host.view(fmt='I')[0] = 123
+        run_linear(linear, jit=True)
+      self.assertEqual(marker_buf.host.view(fmt='I')[0], 123)
+      expected = program_buf.get_buf("CPU")
+      self.assertEqual([b.host.view(fmt='Q')[0] for b in bufs if b.dtype is dtypes.uint64 and b.size == 1], [expected, expected])
 
   def test_ffi_cstruct(self):
     struct_t = init_c_struct_t(16, (("u8", ctypes.c_uint8, 0), ("u16", ctypes.c_uint16, 2),
@@ -431,6 +536,44 @@ class TestHCQ2FFI(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "native call returned 1, expected 0"):
           run_linear(linear, {'usb_addr': 0xfffffffc}, jit=True, wait=False)
         self.assertEqual(calls, [], "a stream crossing 4 GiB must fail before any USB request")
+
+  def test_ffi_usb_subdword_writes(self):
+    calls = []
+    def control(handle, reqtype, request, value, index, data, length, timeout):
+      calls.append(("control", value, index, ctypes.string_at(data, length)))
+      return length
+    def bulk(handle, endpoint, data, length, actual, timeout):
+      calls.append(("bulk", endpoint, length, ctypes.string_at(data, length)))
+      actual[0] = length
+      return 0
+    funcs = {fn.__name__: ctypes.CFUNCTYPE(fn.restype, *fn.argtypes)(stub)
+             for fn, stub in ((libusb.libusb_control_transfer, control), (libusb.libusb_bulk_transfer, bulk))}
+    ptrs = {name: Buffer("CPU", 1, dtypes.uint64, preallocate=True) for name in funcs}
+    for name, fn in funcs.items(): ptrs[name].host.view(fmt='Q')[0] = ctypes.cast(fn, ctypes.c_void_p).value
+    with Context(HCQ_RUNTIME_DEV="CPU", DEBUG=0, PROFILE=0), patch.object(Device["CPU"].pm_bufferize, "rewrite",
+      side_effect=lambda b, ctx: ptrs[b.tag[2]] if isinstance(b.tag, tuple) and b.tag[0] == "cfunc" else None):
+      for dt, index, value in ((dtypes.uint8, 3, 0xA5), (dtypes.uint16, 1, 0xBEEF)):
+        target = UOp.placeholder((8,), dt, device="CPU", tag="target")
+        linear = self._link(usb_write_one(target, 0, (), ("CPU",), UOp.const(index), UOp.const(value, dt)))
+        target_buf = next(u.buffer for u in linear.src[0].src[1:] if u.op is Ops.BUFFER and u.dtype is dt)
+        calls.clear()
+        run_linear(linear, jit=True)
+        address = target_buf.get_buf("CPU") + index * dt.itemsize
+        lane = address & 3
+        byte_en = ((1 << dt.itemsize) - 1) << lane
+        header = struct.pack('<QI', address & ~3, value << (8 * lane))
+        self.assertEqual(calls, [("control", 0x60 | (byte_en << 8), 0, header)])
+      addressed = UOp.placeholder((5,), dtypes.uint8, device="CPU", tag="addressed")
+      target = UOp.placeholder((8,), dtypes.uint16, device="CPU", tag="target")
+      value = (addressed.getaddr(("CPU",)) >> 32).cast(dtypes.uint16)
+      linear = self._link(usb_write_one(target, 0, (), ("CPU",), UOp.const(1), value))
+      refs = [u.buffer for u in linear.src[0].src[1:] if u.op is Ops.BUFFER]
+      target_buf, addressed_buf = next(b for b in refs if b.dtype is dtypes.uint16), next(b for b in refs if b.dtype is dtypes.uint8)
+      calls.clear()
+      run_linear(linear, jit=True)
+      address, value = target_buf.get_buf("CPU") + 2, addressed_buf.get_buf("CPU") >> 32
+      header = struct.pack('<QI', address & ~3, value << (8 * (address & 3)))
+      self.assertEqual(calls, [("control", 0xC60, 0, header)])
 
 
 if __name__ == "__main__":

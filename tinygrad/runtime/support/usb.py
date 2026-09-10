@@ -256,9 +256,15 @@ class USBMMIOInterface(MMIOInterface):
     data = struct.pack(self.fmt, data) if isinstance(data, int) else bytes(data)
     if not self.pcimem: self.usb.scsi_write(data) if self.addr == 0xf000 else self.usb.write(self.addr + off, data)
     else:
-      # writes are whole dwords
-      assert len(data) % 4 == 0 and off % 4 == 0, f"pcie_mem_write requires 4-byte aligned access, got off={off}, sz={len(data)}"
-      self.usb.pcie_mem_write(self.addr+off, data)
+      address, pos = self.addr + off, 0
+      assert address >= (1 << 32) or address + len(data) <= (1 << 32), "PCIe stream crosses 4 GiB"
+      while pos < len(data):
+        if (addr:=address + pos) % 4 == 0 and (size:=(len(data) - pos) // 4 * 4):
+          self.usb.pcie_mem_write(addr, data[pos:pos + size])
+        else:
+          size = min(4 - (addr & 3), len(data) - pos)
+          self.usb.pcie_request(0x60 if addr >> 32 else 0x40, addr, int.from_bytes(data[pos:pos + size], "little"), size)
+        pos += size
 
   def view(self, offset:int=0, size:int|None=None, fmt=None):
     return USBMMIOInterface(self.usb, self.addr+offset, self.nbytes-offset if size is None else size, fmt=fmt or self.fmt, pcimem=self.pcimem)

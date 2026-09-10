@@ -394,11 +394,13 @@ class Compiled:
   timestamp_divider: float = 1000.0
   wait_timeout_ms: float = 30000.0
   sleep_timeout_ms: int|None = None
+  timeline_submit_offset: int = 0
   can_recover:bool = False
   rtalloc_size:int = 64<<20 # the pool every per-linear buffer is carved out of
   var_vals: dict[str, int] = {}
 
   # hcq2
+  pm_stage_copy:Any = None
   pm_batch:Any = None
   pm_encode:Any = None
   pm_lower:Any = None
