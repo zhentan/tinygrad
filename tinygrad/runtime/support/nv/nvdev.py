@@ -1,6 +1,6 @@
 from __future__ import annotations
 import time, functools, tinygrad.runtime.autogen.nv_regs
-from tinygrad.helpers import getenv, DEBUG, getbits, round_up
+from tinygrad.helpers import getenv, DEBUG, getbits, round_up, wait_cond
 from tinygrad.runtime.autogen import pci
 from tinygrad.runtime.support.memory import TLSFAllocator, MemoryManager, AddrSpace
 from tinygrad.runtime.support.nv.ip import NV_FLCN, NV_FLCN_COT, NV_GSP
@@ -70,7 +70,15 @@ class NVPageTableEntry:
 class NVMemoryManager(MemoryManager):
   va_allocator = TLSFAllocator((1 << 44), base=0x1000000000) # global for all devices.
 
-  def on_range_mapped(self): self.dev.NV_VIRTUAL_FUNCTION_PRIV_MMU_INVALIDATE.write((1 << 0) | (1 << 1) | (1 << 6) | (1 << 31))
+  def on_range_mapped(self):
+    if self.dev.mmu_ver == 2:
+      self.dev.NV_VIRTUAL_FUNCTION_PRIV_MMU_INVALIDATE_PDB.write(addr=self.root_page_table.paddr >> 12)
+      self.dev.NV_VIRTUAL_FUNCTION_PRIV_MMU_INVALIDATE_UPPER_PDB.write(0)
+      self.dev.NV_VIRTUAL_FUNCTION_PRIV_MMU_INVALIDATE.write(all_va=1, trigger=1)
+      wait_cond(lambda: self.dev.NV_VIRTUAL_FUNCTION_PRIV_MMU_INVALIDATE.read() & (1 << 31), value=0, timeout_ms=2000,
+                msg="MMU invalidate did not complete")
+    else:
+      self.dev.NV_VIRTUAL_FUNCTION_PRIV_MMU_INVALIDATE.write((1 << 0) | (1 << 1) | (1 << 6) | (1 << 31))
 
 class NVDev:
   def __init__(self, pci_dev:PCIDevice):

@@ -2,10 +2,11 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 import unittest
+from unittest import mock
 
 from tinygrad.runtime.autogen.nv_regs import dev_mmu, dev_vm
 from tinygrad.runtime.support.memory import AddrSpace, MemoryManager
-from tinygrad.runtime.support.nv.nvdev import NVPageTableEntry, NVReg
+from tinygrad.runtime.support.nv.nvdev import NVMemoryManager, NVPageTableEntry, NVReg
 
 
 class FakeVRAM:
@@ -87,6 +88,47 @@ class TestNVPageTableEntry(unittest.TestCase):
     self.assertTrue(mapping.privileged)
     self.assertEqual((mapping.kind, leaf.entry(entry)), (0, 0x28021))
 
+
+class TestNVMMUInvalidate(unittest.TestCase):
+  @staticmethod
+  def manager(dev:FakeNVDev) -> NVMemoryManager:
+    mm = object.__new__(NVMemoryManager)
+    mm.dev, mm.root_page_table = dev, dev.mm.root_page_table
+    return mm
+
+  def test_tu102_invalidate_selects_root(self):
+    dev = FakeNVDev(root_paddr=0x12345000)
+
+    self.manager(dev).on_range_mapped()
+
+    self.assertEqual(dev.writes, [
+      (0xB830A0, 0x123450),
+      (0xB830A4, 0),
+      (0xB830B0, 0x80000001),
+    ])
+
+  def test_mmu_ver3_invalidate_encoding_is_preserved(self):
+    dev = FakeNVDev(mmu_ver=3)
+
+    self.manager(dev).on_range_mapped()
+
+    self.assertEqual(dev.writes, [(0xB830B0, 0x80000043)])
+
+  def test_tu102_invalidate_waits_for_completion(self):
+    dev = FakeNVDev()
+    dev.invalidate_reads = [0x80000001, 0]
+
+    self.manager(dev).on_range_mapped()
+
+    self.assertFalse(dev.invalidate_reads)
+
+  def test_tu102_invalidate_times_out_if_trigger_stays_set(self):
+    dev = FakeNVDev()
+    dev.invalidate_default = 0x80000001
+
+    with mock.patch('tinygrad.helpers.time.perf_counter', side_effect=[0.0, 0.0, 2.001]), \
+         self.assertRaisesRegex(TimeoutError, 'MMU invalidate did not complete'):
+      self.manager(dev).on_range_mapped()
 
 if __name__ == '__main__':
   unittest.main()
