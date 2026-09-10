@@ -1,6 +1,6 @@
 import sys
 import pytest
-from unittest.mock import Mock
+from unittest.mock import Mock, call, patch
 
 @pytest.mark.skipif(sys.platform != "linux", reason="uses linux sysfs layout")
 def test_pci_scan_bus_filters_vendor(monkeypatch):
@@ -107,3 +107,52 @@ def test_usb_pci_discovery(monkeypatch, bridges, cold, header, vendor):
     assert dev.read_config(pci.PCI_VENDOR_ID, 2) == vendor
     dev.write_config(pci.PCI_COMMAND, 2, 2)
     assert writes[-1] == (bridges, pci.PCI_COMMAND, 2)
+
+def test_usb_pci_reset_uses_downstream_bridge(monkeypatch):
+  from tinygrad.runtime.autogen import pci
+  import tinygrad.runtime.support.system as system
+
+  dev = object.__new__(system.USBPCIDevice)
+  dev.gpu_bus, dev.pcibus = 2, "usb:4-3"
+  dev._mem_base, dev._pref_mem_base = 0x10000000, 32 << 30
+  dev._bar_info = {0:(0x10000000, 16 << 20), 1:(32 << 30, 32 << 30), 3:(64 << 30, 32 << 20)}
+  dev.sram = system.BumpAllocator(0x80000, wrap=False)
+  dev.sram.alloc(0x24000)
+  writes, command, bridge_control = [], 0x407, 0
+
+  def config(offset, bus=1, dev=0, fn=0, value=None, size=4):
+    nonlocal command, bridge_control
+    if value is not None:
+      writes.append((bus, fn, offset, value, size))
+      if (bus, fn, offset, size) == (2, 0, pci.PCI_COMMAND, 2): command = value
+      if (bus, fn, offset, size) == (1, 0, pci.PCI_BRIDGE_CONTROL, 2): bridge_control = value
+      return None
+    if (bus, fn, offset, size) == (2, 0, pci.PCI_COMMAND, 2): return command
+    if (bus, fn, offset, size) == (2, 0, pci.PCI_STATUS, 2): return 0x10
+    if (bus, fn, offset, size) == (1, 0, pci.PCI_HEADER_TYPE, 1): return pci.PCI_HEADER_TYPE_BRIDGE
+    if (bus, fn, offset, size) == (1, 0, pci.PCI_BRIDGE_CONTROL, 2): return bridge_control
+    if (bus, fn, offset, size) == (2, 0, pci.PCI_VENDOR_ID, 4): return 0x220410DE
+    raise AssertionError((offset, bus, dev, fn, value, size))
+
+  def restore_bars(usb, gpu_bus, mem_base, pref_mem_base):
+    nonlocal command
+    assert (usb, gpu_bus, mem_base, pref_mem_base) == (dev.usb, 2, 0x10000000, 32 << 30)
+    command = 0x407
+    return {0:(0x10000000, 16 << 20), 1:(32 << 30, 32 << 30), 3:(64 << 30, 32 << 20)}
+
+  dev.usb = Mock(pcie_cfg_req=Mock(side_effect=config))
+  clock = Mock(monotonic=Mock(side_effect=(0.0, 0.1)), sleep=Mock())
+  monkeypatch.setattr(system, "time", clock, raising=False)
+  with patch.object(system.os, "system") as sysfs_reset, patch.object(system.System, "pci_setup_usb_bars", side_effect=restore_bars) as setup:
+    dev.reset()
+
+  sysfs_reset.assert_not_called()
+  setup.assert_called_once_with(dev.usb, gpu_bus=2, mem_base=0x10000000, pref_mem_base=32 << 30)
+  assert writes == [
+    (2, 0, pci.PCI_COMMAND, 0x403, 2),
+    (1, 0, pci.PCI_BRIDGE_CONTROL, pci.PCI_BRIDGE_CTL_BUS_RESET, 2),
+    (1, 0, pci.PCI_BRIDGE_CONTROL, 0, 2),
+    (2, 0, pci.PCI_COMMAND, 0x403, 2),
+  ]
+  assert clock.sleep.call_args_list == [call(0.002), call(0.1)]
+  assert command == 0x403 and dev.sram.ptr == 0

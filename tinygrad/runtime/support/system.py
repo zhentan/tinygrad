@@ -1,5 +1,5 @@
 from __future__ import annotations
-import os, mmap, array, functools, ctypes, ctypes.util, select, contextlib, dataclasses, sys, struct, socket
+import os, mmap, array, functools, ctypes, ctypes.util, select, contextlib, dataclasses, sys, struct, socket, time
 from tinygrad.device import BufferStorage, Buffer, Device
 from tinygrad.helpers import round_up, getenv, OSX, temp, ceildiv, DEBUG, pluralize
 from tinygrad.runtime.autogen import libc, pci, vfio
@@ -245,7 +245,8 @@ class USBPCIDevice(PCIDevice):
       assert header == pci.PCI_HEADER_TYPE_BRIDGE and self.gpu_bus < 255, f"Expected PCI bridge or endpoint at bus {self.gpu_bus}"
       self.write_config(pci.PCI_PRIMARY_BUS, self.gpu_bus | ((self.gpu_bus+1) << 8) | 0xff0000, 4)
     assert self.read_config(pci.PCI_VENDOR_ID, 2) not in (0, 0xffff), f"No PCI endpoint at bus {self.gpu_bus}"
-    self._bar_info = System.pci_setup_usb_bars(self.usb, gpu_bus=self.gpu_bus, mem_base=0x10000000, pref_mem_base=(32 << 30))
+    self._mem_base, self._pref_mem_base = 0x10000000, 32 << 30
+    self._bar_info = System.pci_setup_usb_bars(self.usb, gpu_bus=self.gpu_bus, mem_base=self._mem_base, pref_mem_base=self._pref_mem_base)
     self.sram = BumpAllocator(size=0x80000, wrap=False) # asm24 controller sram
 
   def dma_view(self, ctrl_addr, size): return USBMMIOInterface(self.usb, ctrl_addr, size, fmt='B', pcimem=False)
@@ -254,6 +255,58 @@ class USBPCIDevice(PCIDevice):
 
   def read_config(self, offset:int, size:int): return self.usb.pcie_cfg_req(offset, bus=self.gpu_bus, dev=0, fn=0, size=size)
   def write_config(self, offset:int, value:int, size:int): self.usb.pcie_cfg_req(offset, bus=self.gpu_bus, dev=0, fn=0, value=value, size=size)
+
+  def reset(self):
+    def disable_bus_mastering():
+      command = self.read_config(pci.PCI_COMMAND, 2)
+      self.write_config_flush(pci.PCI_COMMAND, command & ~pci.PCI_COMMAND_MASTER, 2)
+      if self.read_config(pci.PCI_COMMAND, 2) & pci.PCI_COMMAND_MASTER: raise RuntimeError("USB PCI reset left bus mastering enabled")
+
+    disable_bus_mastering()
+    expected_identity = self.usb.pcie_cfg_req(pci.PCI_VENDOR_ID, bus=self.gpu_bus, dev=0, fn=0, size=4)
+    if expected_identity in (0, 0xffffffff): raise RuntimeError("USB PCI endpoint identity is unavailable before reset")
+    bridge_bus = self.gpu_bus - 1
+    if bridge_bus < 0 or self.usb.pcie_cfg_req(pci.PCI_HEADER_TYPE, bus=bridge_bus, dev=0, fn=0, size=1) & \
+       pci.PCI_HEADER_TYPE_MASK != pci.PCI_HEADER_TYPE_BRIDGE:
+      raise RuntimeError("USB PCI endpoint has no immediate upstream bridge")
+    bridge_control = self.usb.pcie_cfg_req(pci.PCI_BRIDGE_CONTROL, bus=bridge_bus, dev=0, fn=0, size=2)
+    if bridge_control & pci.PCI_BRIDGE_CTL_BUS_RESET: raise RuntimeError("USB PCI secondary-bus reset is already asserted")
+    try:
+      self.usb.pcie_cfg_req(pci.PCI_BRIDGE_CONTROL, bus=bridge_bus, dev=0, fn=0,
+                            value=bridge_control | pci.PCI_BRIDGE_CTL_BUS_RESET, size=2)
+      if self.usb.pcie_cfg_req(pci.PCI_BRIDGE_CONTROL, bus=bridge_bus, dev=0, fn=0, size=2) != \
+         bridge_control | pci.PCI_BRIDGE_CTL_BUS_RESET:
+        raise RuntimeError("USB PCI secondary-bus reset assertion did not read back")
+      time.sleep(0.002)
+    finally:
+      try: self.usb.pcie_cfg_req(pci.PCI_BRIDGE_CONTROL, bus=bridge_bus, dev=0, fn=0, value=bridge_control, size=2)
+      finally: time.sleep(0.1)
+    if self.usb.pcie_cfg_req(pci.PCI_BRIDGE_CONTROL, bus=bridge_bus, dev=0, fn=0, size=2) != bridge_control:
+      raise RuntimeError("USB PCI secondary-bus reset deassertion did not read back")
+
+    deadline = time.monotonic() + 1
+    while True:
+      try: identity = self.usb.pcie_cfg_req(pci.PCI_VENDOR_ID, bus=self.gpu_bus, dev=0, fn=0, size=4)
+      except RuntimeError: identity = None
+      if identity == expected_identity: break
+      if identity not in (None, 0, 0xffffffff): raise RuntimeError(f"USB PCI endpoint identity changed across reset: {identity:#x}")
+      if time.monotonic() >= deadline: raise RuntimeError("USB PCI endpoint did not return after secondary-bus reset")
+      time.sleep(0.05)
+
+    prior_bars = self._bar_info
+    try:
+      restored_bars = System.pci_setup_usb_bars(self.usb, gpu_bus=self.gpu_bus,
+                                                mem_base=self._mem_base, pref_mem_base=self._pref_mem_base)
+      if restored_bars != prior_bars: raise RuntimeError(f"USB PCI BAR mapping changed across reset: {restored_bars} != {prior_bars}")
+    except BaseException as error:
+      try: disable_bus_mastering()
+      except BaseException as cleanup_error:
+        raise BaseExceptionGroup("USB PCI reset and bus-master cleanup failed", [error, cleanup_error])
+      raise
+    disable_bus_mastering()
+    status = self.read_config(pci.PCI_STATUS, 2)
+    if status & 0xf900: raise RuntimeError(f"USB PCI status fault after reset: {status:#x}")
+    self.sram = BumpAllocator(size=0x80000, wrap=False)
 
   def bar_info(self, bar_idx:int) -> tuple[int, int]: return self._bar_info[bar_idx]  # type: ignore[override]
   def map_bar(self, bar, off=0, addr=0, size=None, fmt='B'):
