@@ -96,6 +96,11 @@ class NV_FLCN(NV_IP):
                         self.nvdev.NV_PGC6_AON_SECURE_SCRATCH_GROUP_05[0].read() & 0xff == 0xff, "waiting for reset")
 
   def init_sw(self):
+    self.init_regs()
+    self.prep_ucode()
+    self.prep_booter()
+
+  def init_regs(self):
     self.nvdev.include("dev_gsp", "ga102")
     self.nvdev.include("dev_falcon_v4", "ga102")
     self.nvdev.include("dev_riscv_pri", "ga102")
@@ -103,9 +108,6 @@ class NV_FLCN(NV_IP):
     self.nvdev.include("dev_falcon_second_pri", "ga102")
     self.nvdev.include("dev_sec_pri", "ga102")
     self.nvdev.include("dev_bus", "tu102")
-
-    self.prep_ucode()
-    self.prep_booter()
 
   def prep_ucode(self):
     vbios_bytes, vbios_off = memoryview(bytes(array.array('I', self.nvdev.mmio[0x00300000//4:(0x00300000+0x100000)//4]))), 0
@@ -233,24 +235,38 @@ class NV_FLCN(NV_IP):
 
   def wait_cpu_halted(self, base): wait_cond(lambda: self.nvdev.NV_PFALCON_FALCON_CPUCTL.with_base(base).read_bitfields()['halted'], msg="not halted")
 
-  def execute_hs(self, base, img_paddr, code_off, data_off, imemPa, imemVa, imemSz, dmemPa, dmemVa, dmemSz, pkc_off, engid, ucodeid, mailbox=None):
+  def execute_hs(self, base, img_paddr, code_off, data_off, imemPa, imemVa, imemSz, dmemPa, dmemVa, dmemSz, pkc_off, engid, ucodeid,
+                 mailbox=None, ctx_dma=0, target=0, dma_gate=None, brom_offset=0x1000):
     self.disable_ctx_req(base)
 
-    # target=0 is FB (not in published headers)
-    self.nvdev.NV_PFALCON_FBIF_TRANSCFG.with_base(base)[ctx_dma:=0].update(target=0, mem_type=self.nvdev.NV_PFALCON_FBIF_TRANSCFG_MEM_TYPE_PHYSICAL)
+    # target=0 is FB (not in published headers), target=1 is coherent system memory.
+    self.nvdev.NV_PFALCON_FBIF_TRANSCFG.with_base(base)[ctx_dma].update(target=target,
+      mem_type=self.nvdev.NV_PFALCON_FBIF_TRANSCFG_MEM_TYPE_PHYSICAL)
 
-    cmd = self.nvdev.NV_PFALCON_FALCON_DMATRFCMD.with_base(base).encode(write=0, size=self.nvdev.NV_PFALCON_FALCON_DMATRFCMD_SIZE_256B,
-      ctxdma=ctx_dma, imem=1, sec=1)
-    self.execute_dma(base, cmd, dest=imemPa, mem_off=imemVa, src=img_paddr+code_off-imemVa, size=imemSz)
+    try:
+      if dma_gate is not None: dma_gate(True)
+      cmd = self.nvdev.NV_PFALCON_FALCON_DMATRFCMD.with_base(base).encode(write=0,
+        size=self.nvdev.NV_PFALCON_FALCON_DMATRFCMD_SIZE_256B, ctxdma=ctx_dma, imem=1, sec=1)
+      self.execute_dma(base, cmd, dest=imemPa, mem_off=imemVa, src=img_paddr+code_off-imemVa, size=imemSz)
 
-    cmd = self.nvdev.NV_PFALCON_FALCON_DMATRFCMD.with_base(base).encode(write=0, size=self.nvdev.NV_PFALCON_FALCON_DMATRFCMD_SIZE_256B,
-      ctxdma=ctx_dma, imem=0, sec=0)
-    self.execute_dma(base, cmd, dest=dmemPa, mem_off=dmemVa, src=img_paddr+data_off-dmemVa, size=dmemSz)
+      cmd = self.nvdev.NV_PFALCON_FALCON_DMATRFCMD.with_base(base).encode(write=0,
+        size=self.nvdev.NV_PFALCON_FALCON_DMATRFCMD_SIZE_256B, ctxdma=ctx_dma, imem=0, sec=0)
+      self.execute_dma(base, cmd, dest=dmemPa, mem_off=dmemVa, src=img_paddr+data_off-dmemVa, size=dmemSz)
+    except BaseException as error:
+      if dma_gate is not None:
+        try: dma_gate(False)
+        except BaseException as cleanup_error:
+          raise BaseExceptionGroup("Falcon DMA and bus-master cleanup failed", [error, cleanup_error])
+      raise
+    else:
+      if dma_gate is not None: dma_gate(False)
 
-    self.nvdev.NV_PFALCON2_FALCON_BROM_PARAADDR.with_base(base)[0].write(pkc_off)
-    self.nvdev.NV_PFALCON2_FALCON_BROM_ENGIDMASK.with_base(base).write(engid)
-    self.nvdev.NV_PFALCON2_FALCON_BROM_CURR_UCODE_ID.with_base(base).write(val=ucodeid)
-    self.nvdev.NV_PFALCON2_FALCON_MOD_SEL.with_base(base).write(algo=self.nvdev.NV_PFALCON2_FALCON_MOD_SEL_ALGO_RSA3K)
+    # NVDEC's second register window is at 0x1c00; GSP and SEC2 use 0x1000.
+    base2 = base + brom_offset - 0x1000
+    self.nvdev.NV_PFALCON2_FALCON_BROM_PARAADDR.with_base(base2)[0].write(pkc_off)
+    self.nvdev.NV_PFALCON2_FALCON_BROM_ENGIDMASK.with_base(base2).write(engid)
+    self.nvdev.NV_PFALCON2_FALCON_BROM_CURR_UCODE_ID.with_base(base2).write(val=ucodeid)
+    self.nvdev.NV_PFALCON2_FALCON_MOD_SEL.with_base(base2).write(algo=self.nvdev.NV_PFALCON2_FALCON_MOD_SEL_ALGO_RSA3K)
 
     self.nvdev.NV_PFALCON_FALCON_BOOTVEC.with_base(base).write(imemVa)
 
