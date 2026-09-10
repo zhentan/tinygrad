@@ -1,0 +1,58 @@
+{
+  "old_head": "d72c079de9af8d0639933b7b549661a0f798d2b9",
+  "target": "b45cee5ccd127266a70a8fed14ebe43196f7d95d",
+  "old_base": "fec703cbecad430857c6bedd94a9500e871a4bcc",
+  "remote_usb_head": "d3df666b84c1af840eaab042385212dae2626ac6",
+  "backup": "backup/chestnut-before-fork-rebase-20260909-d72c079",
+  "rebased_head": "d3df666b84c1af840eaab042385212dae2626ac6",
+  "rebased_tree": "a0078bda8a23785a25c3242aba1536859bc2cd6e",
+  "commits_above_target": 92,
+  "original_commits_retained": 89,
+  "integration_commits": 2,
+  "target_is_ancestor": true,
+  "cpu": {
+    "passed": 636,
+    "skipped": 44,
+    "subtests_passed": 239,
+    "junit": "cpu-03.xml"
+  },
+  "mypy": "218 source files clean",
+  "ruff": "PASS",
+  "hardware_status": "passed_after_cache_fix",
+  "hardware_result": "hardware-02/result.json",
+  "hardware_counts": {
+    "passed": 520,
+    "skipped": 21,
+    "subtests_passed": 165
+  },
+  "performance_failure": {
+    "copyin_warm_MB_per_second": 3.43,
+    "copyout_warm_MB_per_second": 1.21,
+    "trace": "copy-compile-trace-02.log",
+    "cause": "USB staging creates fresh scratch parameters before upstream prepared-graph cache lookup; each copy recompiles"
+  },
+  "hardware_final_result": "hardware-02/result.json",
+  "cache_fix": {
+    "commit": "8eb65a7d20a9de40a5ad2ebee42fd8ab2fddc25a",
+    "regression_red": "staging-cache-red.log",
+    "regression_green": "staging-cache-green.log",
+    "hardware_check": "copy-cache-green/result.json",
+    "buffer_retention_test_passed": true
+  },
+  "runtime_test_head": "8eb65a7d20a9de40a5ad2ebee42fd8ab2fddc25a",
+  "runtime_test_tree": "f4d68b61132b877f06905d6665ebc7c026003bc4",
+  "documentation_commits": 1,
+  "hardware_process_exit_code": 0,
+  "hardware_cleanup_errors": [],
+  "hardware_pytest_seconds": 926.736,
+  "only_change_since_full_gate": "docs/adr/0001-native-nv-over-chestnut-usb.md",
+  "first_rebased_hardware_result": "hardware-01/result.json",
+  "final_transfer_samples": "final-transfer-samples.json",
+  "mypy_log": "mypy-cache.log",
+  "ruff_log": "ruff-cache.log",
+  "fresh_process_result": "fresh-process.json",
+  "fresh_process_passes": 1,
+  "prior_100_pass_head": "d72c079de9af8d0639933b7b549661a0f798d2b9",
+  "fork_push": "fork-push.json",
+  "status": "validated_and_pushed"
+}
