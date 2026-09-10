@@ -9,6 +9,7 @@ from tinygrad.helpers import Context
 from tinygrad.runtime import ops_nv
 from tinygrad.runtime.support import hcq2
 from tinygrad.runtime.support.memory import AddrSpace
+from tinygrad.runtime.support.usb import USB3
 from tinygrad.runtime.support.nv.usb import pm_usb_hostio, pm_usb_stage, usb_stage_copy
 from tinygrad.runtime.support.nv import usb as nvusb
 from tinygrad.uop.ops import Ops, PatternMatcher, UOp, graph_rewrite
@@ -81,6 +82,59 @@ class TestNVUSBIface(unittest.TestCase):
         store = b.index(0).store(UOp.const(1, dtypes.uint8))
         self.assertIs(graph_rewrite(store, pm_usb_hostio, walk=True), store)
     allocated.assert_called_once_with("CPU", 256 << 10, dtypes.uint8, preallocate=True)
+
+  def test_download_dma_staging_is_shared_and_cpu_addressable(self):
+    dev = object.__new__(ops_nv.NVDevice)
+    dev.iface = object.__new__(ops_nv.USBIface)
+    usb = dev.iface.pci_dev = Mock()
+    usb.usb.usb.alloc_dma.return_value = memoryview(bytearray(512 << 10))
+    with patch.object(ops_nv, "Buffer", wraps=Buffer) as allocated:
+      for _ in range(300):
+        b = UOp.placeholder((512 << 10,), dtypes.uint8, device=("NV",), tag=("hcq_host", "usb_download"))
+        self.assertIs(nvusb.pm_usb_bufferize.rewrite(b, ctx=dev), dev.usb_download)
+        load = b.index(0).load()
+        self.assertIs(graph_rewrite(load, pm_usb_hostio, walk=True), load)
+    dev.usb_download.host.view(fmt='B')[3] = 123
+    self.assertEqual(usb.usb.usb.alloc_dma.return_value[3], 123)
+    usb.usb.usb.alloc_dma.assert_called_once_with(512 << 10)
+    allocated.assert_called_once_with("CPU", 512 << 10, dtypes.uint8, opaque=usb.usb.usb.alloc_dma.return_value)
+
+  def test_dma_staging_survives_wrapper_failure_until_device_cleanup(self):
+    dev = object.__new__(ops_nv.NVDevice)
+    dev.iface = iface = object.__new__(ops_nv.USBIface)
+    client = object.__new__(USB3)
+    client.handle, client._dma_buffers = object(), []
+    iface.pci_dev, iface.dev_impl = SimpleNamespace(usb=SimpleNamespace(usb=client)), Mock()
+    storage = (ctypes.c_ubyte * (512 << 10))()
+    ptr = ctypes.cast(storage, ctypes.POINTER(ctypes.c_ubyte))
+    with patch("tinygrad.runtime.support.usb.libusb.libusb_dev_mem_alloc", return_value=ptr), \
+         patch("tinygrad.runtime.support.usb.libusb.libusb_dev_mem_free", return_value=0) as freed, \
+         patch.object(ops_nv, "Buffer", side_effect=RuntimeError("CPU buffer failed")):
+      with self.assertRaisesRegex(RuntimeError, "CPU buffer failed"): _ = dev.usb_download
+      self.assertNotIn("usb_download", dev.__dict__)
+      freed.assert_not_called()
+      iface.device_fini()
+      iface.device_fini()
+    freed.assert_called_once_with(client.handle, ptr, 512 << 10)
+
+  def test_native_shutdown_preserves_both_errors_and_still_frees_dma(self):
+    for native_failure, dma_failure in ((False, False), (True, False), (False, True), (True, True)):
+      iface, calls = object.__new__(ops_nv.USBIface), []
+      errors = [RuntimeError("native shutdown"), RuntimeError("DMA cleanup")]
+      def fini():
+        calls.append("native")
+        if native_failure: raise errors[0]
+      def free():
+        calls.append("DMA")
+        if dma_failure: raise errors[1]
+      iface.dev_impl = SimpleNamespace(fini=fini)
+      iface.pci_dev = SimpleNamespace(usb=SimpleNamespace(usb=SimpleNamespace(free_dma_buffers=free)))
+      with self.subTest(native=native_failure, dma=dma_failure):
+        if not native_failure and not dma_failure: iface.device_fini()
+        else:
+          with self.assertRaises(BaseExceptionGroup) as raised: iface.device_fini()
+          self.assertEqual(raised.exception.exceptions, tuple(e for e, failed in zip(errors, (native_failure, dma_failure)) if failed))
+        self.assertEqual(calls, ["native", "DMA"])
 
   def test_sram_readback_bounds_batches_and_waits_for_each_host_ready(self):
     cpu, window = Device["CPU"], 256 << 10

@@ -184,7 +184,7 @@ def _usb_sram_upload(dst:UOp, src:UOp, devs:tuple[str, ...], win:Buffer, slot:in
 def _usb_sram_readback(dst:UOp, src:UOp, devs:tuple[str, ...], win:Buffer, prefix:int) -> UOp:
   total, stage = dst.nbytes(), UOp.from_buffer(win)
   host = dst if to_tuple(dst.device)[0].startswith("CPU") else UOp.placeholder((total,), dtypes.uint8, device="CPU", tag="usb_staging")
-  pad = UOp.placeholder((round_up(prefix + min(total, win.size), 512),), dtypes.uint8, device="CPU", tag="usb_staging")
+  pad = UOp.placeholder((prefix + win.size,), dtypes.uint8, device=devs, tag=("hcq_host", "usb_download"))
   ready = UOp.placeholder((1,), dtypes.uint64, device=devs, tag="usb_readback_done")
   cq = UOp.placeholder((0x1000,), dtypes.uint8, device=devs, tag="usb_read_cq")
   commands = [UOp(Ops.INS, src=(timeline(devs), timeline_value(devs)), arg=("wait", dtypes.void))]
@@ -225,6 +225,7 @@ def usb_handle_buffer(ctx:Any) -> Buffer:
 pm_usb_bufferize = PatternMatcher([
   (UPat(Ops.PARAM, tag="usb_handle"), usb_handle_buffer),
   (UPat(Ops.PARAM, tag={("hcq_host", "usb_upload")}), lambda ctx: ctx.usb_upload),
+  (UPat(Ops.PARAM, tag={("hcq_host", "usb_download")}), lambda ctx: ctx.usb_download),
   (UPat(Ops.PARAM, tag="usb_readback_done"), lambda ctx: ctx.usb_readback_done),
   (UPat(Ops.PARAM, tag="usb_read_cq"), lambda ctx: ctx.usb_read_cq),
 ])

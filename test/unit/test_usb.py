@@ -1,8 +1,52 @@
 import ctypes
+from unittest.mock import Mock
 from types import SimpleNamespace
 import pytest
 from tinygrad.runtime.autogen import libusb
 from tinygrad.runtime.support import usb
+
+def dma_client(monkeypatch, size=32):
+  storage = (ctypes.c_ubyte * size)()
+  ptr = ctypes.cast(storage, ctypes.POINTER(ctypes.c_ubyte))
+  api = SimpleNamespace(libusb_dev_mem_alloc=Mock(return_value=ptr), libusb_dev_mem_free=Mock(return_value=0),
+                        libusb_strerror=lambda _: b"injected DMA error")
+  api.libusb_dev_mem_free.__name__ = "libusb_dev_mem_free"
+  monkeypatch.setattr(usb, "libusb", api)
+  client = object.__new__(usb.USB3)
+  client.handle, client._dma_buffers = object(), []
+  return client, api, storage
+
+def test_dma_allocation_stays_owned_until_explicit_cleanup(monkeypatch):
+  client, api, storage = dma_client(monkeypatch)
+  view = client.alloc_dma(len(storage))
+  view[3] = 123
+  assert storage[3] == 123
+  api.libusb_dev_mem_alloc.assert_called_once_with(client.handle, len(storage))
+  ptr = api.libusb_dev_mem_alloc.return_value
+  del view
+  api.libusb_dev_mem_free.assert_not_called()
+  client.free_dma_buffers()
+  client.free_dma_buffers()
+  api.libusb_dev_mem_free.assert_called_once_with(client.handle, ptr, len(storage))
+  assert not client._dma_buffers
+
+def test_dma_null_allocation_does_not_fall_back(monkeypatch):
+  client, api, _ = dma_client(monkeypatch)
+  api.libusb_dev_mem_alloc.return_value = ctypes.POINTER(ctypes.c_ubyte)()
+  with pytest.raises(RuntimeError, match="USB DMA allocation failed"): client.alloc_dma(32)
+  assert not client._dma_buffers
+  client.free_dma_buffers()
+  api.libusb_dev_mem_alloc.assert_called_once()
+  api.libusb_dev_mem_free.assert_not_called()
+
+def test_dma_free_failure_keeps_ownership_and_is_reported(monkeypatch):
+  client, api, _ = dma_client(monkeypatch)
+  client.alloc_dma(32)
+  owned = list(client._dma_buffers)
+  api.libusb_dev_mem_free.return_value = -1
+  with pytest.raises(RuntimeError, match="injected DMA error"): client.free_dma_buffers()
+  assert client._dma_buffers == owned
+  api.libusb_dev_mem_free.assert_called_once()
 
 @pytest.mark.parametrize("failure", [None, "open", "get_device_descriptor", "get_string_descriptor_ascii", "product",
   "kernel_driver_active", "detach_kernel_driver", "reset_device", "set_configuration", "claim_interface", "set_interface_alt_setting", "interrupt"])

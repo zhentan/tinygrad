@@ -685,6 +685,13 @@ class USBIface(PCIIface):
     super().free(storage)
     self._native_memory.pop(storage.meta.hMemory, None)
 
+  def device_fini(self):
+    errors:list[BaseException] = []
+    for action in (super().device_fini, self.pci_dev.usb.usb.free_dma_buffers):
+      try: action()
+      except BaseException as error: errors.append(error)
+    if errors: raise BaseExceptionGroup("NV USB shutdown failed", errors)
+
   def sleep(self, timeout): pass
 
 class MOCKIface(NVKIface): count = 1
@@ -765,6 +772,11 @@ class NVDevice(Compiled):
   def usb_upload(self) -> Buffer:
     # Shared synchronous staging must not consume a runtime-ring allocation for every copy in a large schedule.
     return Buffer("CPU", 256 << 10, dtypes.uint8, preallocate=True)
+
+  @functools.cached_property
+  def usb_download(self) -> Buffer:
+    if not isinstance(self.iface, USBIface): raise RuntimeError("USB DMA staging is only available through USBIface")
+    return Buffer("CPU", 512 << 10, dtypes.uint8, opaque=self.iface.pci_dev.usb.usb.alloc_dma(512 << 10))
 
   @functools.cached_property
   def usb_readback(self) -> Buffer:

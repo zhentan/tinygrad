@@ -43,6 +43,7 @@ class USB3:
     self._tags, self._transferred = itertools.count(1), ctypes.c_int(0)
     self._bulk_buf, self._bulk_mv = alloc_cbuffer(4 << 20)
     self._ctrl_buf, self._ctrl_mv = alloc_cbuffer(0x1000)
+    self._dma_buffers:list[tuple[c.POINTER[ctypes.c_ubyte], int]] = []
     # async bulk OUT state: tag -> (pooled transfer, keepalive payload mv); transfer errors latch into _async_err
     self._async_seq, self._async_err = itertools.count(1), 0
     self._async_pending: dict = {}
@@ -73,6 +74,17 @@ class USB3:
       libusb.libusb_close(self.handle)
       self.handle = type(self.handle)()
       raise
+
+  def alloc_dma(self, size:int) -> memoryview:
+    if not (ptr:=libusb.libusb_dev_mem_alloc(self.handle, size)): raise RuntimeError(f"USB DMA allocation failed for {size} bytes")
+    self._dma_buffers.append((ptr, size))
+    return to_mv(ctypes.addressof(ptr.contents), size)
+
+  def free_dma_buffers(self): # callers must finish all transfers before releasing their staging memory
+    while self._dma_buffers:
+      ptr, size = self._dma_buffers[-1]
+      checked(libusb.libusb_dev_mem_free)(self.handle, ptr, size)
+      self._dma_buffers.pop()
 
   def control_write(self, request:int, value:int=0, index:int=0, data:bytes=b'', timeout:int=1000):
     assert len(data) <= len(self._ctrl_mv)
