@@ -192,6 +192,40 @@ class TestUSBPCITransfers(unittest.TestCase):
           else: controller.pcie_mem_read(0xfffffffc, 8)
         self.assertEqual(controller.usb.mock_calls, [])
 
+  def test_bulk_write_chunks_payload_to_reusable_buffer(self):
+    usb = object.__new__(USB3)
+    usb.handle = None
+    usb._bulk_buf, usb._bulk_mv = alloc_cbuffer(4)
+    usb._transferred = ctypes.c_int(0)
+    chunks = []
+    def transfer(_handle, endpoint, data, length, transferred, timeout):
+      self.assertEqual((endpoint, timeout), (0x02, 1234))
+      chunks.append(bytes(data[:length]))
+      transferred.value = length
+      return 0
+
+    with patch('tinygrad.runtime.support.usb.libusb.libusb_bulk_transfer', side_effect=transfer):
+      usb.bulk_write(b'abcdefghij', timeout=1234)
+
+    self.assertEqual(chunks, [b'abcd', b'efgh', b'ij'])
+
+  def test_bulk_write_bounds_each_transfer(self):
+    usb = object.__new__(USB3)
+    usb.handle = None
+    size = (256 << 10) + 4
+    usb._bulk_buf, usb._bulk_mv = alloc_cbuffer(size)
+    usb._transferred = ctypes.c_int(0)
+    lengths = []
+    def transfer(_handle, _endpoint, _data, length, transferred, _timeout):
+      lengths.append(length)
+      transferred.value = length
+      return 0
+
+    with patch('tinygrad.runtime.support.usb.libusb.libusb_bulk_transfer', side_effect=transfer):
+      usb.bulk_write(bytes(size))
+
+    self.assertEqual(lengths, [256 << 10, 4])
+
 class TestUSBPCIBars(unittest.TestCase):
   def test_resize_all_bars(self):
     for count in (0, 1, 3):

@@ -19,6 +19,8 @@ def checked(fn, msg=None):
   return wrapper
 
 class USB3:
+  BULK_WRITE_CHUNK_BYTES = 256 << 10
+
   @staticmethod
   @functools.cache
   def ctx():
@@ -83,11 +85,14 @@ class USB3:
     return self._ctrl_mv[:length]
 
   def bulk_write(self, payload:bytes, timeout:int=1000):
-    if len(payload) > len(self._bulk_mv): self._bulk_buf, self._bulk_mv = alloc_cbuffer(len(payload))
-    self._bulk_mv[:len(payload)] = payload
-    checked(libusb.libusb_bulk_transfer, "bulk OUT 0x02 failed") \
-      (self.handle, 0x02, self._bulk_buf, len(payload), self._transferred, timeout)
-    assert self._transferred.value == len(payload), f"bulk OUT short write: {self._transferred.value}/{len(payload)} bytes"
+    source = memoryview(payload)
+    chunk_bytes = min(self.BULK_WRITE_CHUNK_BYTES, len(self._bulk_mv))
+    for offset in range(0, len(source), chunk_bytes):
+      length = min(chunk_bytes, len(source) - offset)
+      self._bulk_mv[:length] = source[offset:offset + length]
+      checked(libusb.libusb_bulk_transfer, "bulk OUT 0x02 failed") \
+        (self.handle, 0x02, self._bulk_buf, length, self._transferred, timeout)
+      assert self._transferred.value == length, f"bulk OUT short write: {self._transferred.value}/{length} bytes"
 
   def _on_bulk_done(self, xfer):  # runs in libusb event handling; latch errors (exceptions here are unraisable)
     exp = xfer.contents.length - 8 if xfer.contents.type == libusb.LIBUSB_TRANSFER_TYPE_CONTROL else xfer.contents.length
