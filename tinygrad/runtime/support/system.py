@@ -252,7 +252,7 @@ class USBPCIDevice(PCIDevice):
   def dma_view(self, ctrl_addr, size): return USBMMIOInterface(self.usb, ctrl_addr, size, fmt='B', pcimem=False)
   def alloc_sysmem(self, size:int, vaddr:int=0, contiguous:bool=False) -> tuple[MMIOInterface, list[int]]:
     off = self.sram.alloc(size)
-    return self.dma_view(0xf000 + off, size), [0x200000 + off + page for page in range(0, size, mmap.PAGESIZE)]
+    return self.dma_view(0xf000 + off, size), [0x200000 + off + page for page in range(0, size, 0x1000)]
 
   def read_config(self, offset:int, size:int): return self.usb.pcie_cfg_req(offset, bus=self.gpu_bus, dev=0, fn=0, size=size)
   def write_config(self, offset:int, value:int, size:int): self.usb.pcie_cfg_req(offset, bus=self.gpu_bus, dev=0, fn=0, value=value, size=size)

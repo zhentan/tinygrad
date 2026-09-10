@@ -363,14 +363,16 @@ class TestUSBPCITransfers(unittest.TestCase):
 
 class TestUSBPCIBars(unittest.TestCase):
   def test_sysmem_returns_every_page(self):
-    dev = object.__new__(USBPCIDevice)
-    dev.usb, dev.sram = Mock(), BumpAllocator(0x80000, wrap=False)
-    dev.sram.alloc(0x40000)
+    for host_page_size in (0x1000, 0x4000):
+      with self.subTest(host_page_size=host_page_size), patch('tinygrad.runtime.support.system.mmap.PAGESIZE', host_page_size):
+        dev = object.__new__(USBPCIDevice)
+        dev.usb, dev.sram = Mock(), BumpAllocator(0x80000, wrap=False)
+        dev.sram.alloc(0x40000)
 
-    view, paddrs = dev.alloc_sysmem(0x3000)
+        view, paddrs = dev.alloc_sysmem(0x3000)
 
-    self.assertEqual((view.addr, view.nbytes), (0x4f000, 0x3000))
-    self.assertEqual(paddrs, [0x240000, 0x241000, 0x242000])
+        self.assertEqual((view.addr, view.nbytes), (0x4f000, 0x3000))
+        self.assertEqual(paddrs, [0x240000, 0x241000, 0x242000])
 
   def test_resize_all_bars(self):
     for count in (0, 1, 3):
