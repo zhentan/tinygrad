@@ -3,7 +3,8 @@ import os, ctypes, contextlib, re, functools, mmap, struct, array, sys, itertool
 assert sys.platform != 'win32'
 from typing import Any
 from dataclasses import dataclass, replace
-from tinygrad.runtime.support.hcq2 import HWQueue, encode_submit, patch, to_name, unwrap_view, make_submit, timeline, HCQInfo, lower_call, hcq_link
+from tinygrad.runtime.support.hcq2 import HWQueue, encode_submit, patch, to_name, unwrap_view
+from tinygrad.runtime.support.hcq2 import make_submit, timeline, HCQInfo, HCQ_RUNTIME_DEV, lower_call, hcq_link
 from tinygrad.runtime.support.hcq import MMIOInterface, FileIOInterface, BumpAllocator, hcq_filter_visible_devices
 from tinygrad.uop.ops import Ops, UOp, UPat, PatternMatcher, KernelInfo
 from tinygrad.engine.realize import get_call_arg_uops, get_call_var_uops, lower_and_compile, run_linear
@@ -125,7 +126,8 @@ class NVQueue(HWQueue):
   def submit(self, cmdbuf:UOp) -> UOp:
     fifo, ib, off = self.dev.fifos[self.queue], *unwrap_view(cmdbuf)
 
-    ring, gpput, doorbell, put, gpentry = [UOp.placeholder((sz,), dt, device=self.devs, volatile=True, tag=_queue_tag(nm, self.queue))
+    ring, gpput, doorbell, put, gpentry = [UOp.placeholder((sz,), dt, device=HCQ_RUNTIME_DEV.value if nm == "gpentry" else self.devs,
+                                                        volatile=True, tag=_queue_tag(nm, self.queue))
       for nm, dt, sz in (("ring", dtypes.uint64, fifo.entries), ("gpput", dtypes.uint32, 1), ("doorbell", dtypes.uint32, 1),
                          ("put_value", dtypes.uint64, 1), ("gpentry", dtypes.uint64, 1))]
     gpentry = patch(gpentry, [(0, ib.getaddr(self.devs) + UOp.const(off | (cmdbuf.max_numel() // 4 << 42) | (1 << 41), dtypes.uint64))])
@@ -758,6 +760,11 @@ class NVDevice(Compiled):
     if not isinstance(self.iface, USBIface): raise RuntimeError("USB staging is only available through USBIface")
     memory = self.iface.alloc_usb_sram(256 << 10)
     return Buffer(self.device, 256 << 10, dtypes.uint8, opaque=memory)
+
+  @functools.cached_property
+  def usb_upload(self) -> Buffer:
+    # Shared synchronous staging must not consume a runtime-ring allocation for every copy in a large schedule.
+    return Buffer("CPU", 256 << 10, dtypes.uint8, preallocate=True)
 
   @functools.cached_property
   def usb_readback(self) -> Buffer:

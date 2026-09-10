@@ -4,6 +4,7 @@ from unittest.mock import Mock, patch
 
 from tinygrad.device import BufferStorage, Buffer, BufferSpec, Device
 from tinygrad.dtype import dtypes
+from tinygrad.engine.realize import ExecContext, exec_copy
 from tinygrad.helpers import Context
 from tinygrad.runtime import ops_nv
 from tinygrad.runtime.support import hcq2
@@ -14,39 +15,128 @@ from tinygrad.uop.ops import Ops, PatternMatcher, UOp, graph_rewrite
 
 
 class TestNVUSBIface(unittest.TestCase):
+  def test_batched_host_copies_preserve_typed_buffers_and_offsets(self):
+    cpu, window = Device["CPU"], 256 << 10
+    win = Mock(device="NV", dtype=dtypes.uint8, size=window, host=SimpleNamespace(addr=0x4f000))
+    dev = SimpleNamespace(pm_stage_copy=pm_usb_stage, usb_sram_readback=True, usb_sram=win)
+    for cin in (False, True):
+      batch = 32 * (window // 2 - 512) if cin else 64 * window
+      for dtype in (dtypes.uint8, dtypes.float32, dtypes.uint64):
+        for total in (dtype.itemsize, batch + dtype.itemsize):
+          with self.subTest(upload=cin, dtype=dtype, total=total):
+            payload = (bytes(range(256)) * ((total + 255) // 256))[:total]
+            data = memoryview(bytearray(b'\xa5' * (total + 2 * dtype.itemsize)))
+            if cin: data[dtype.itemsize:-dtype.itemsize] = payload
+            host = UOp.from_buffer(Buffer("PYTHON", total // dtype.itemsize + 2, dtype, opaque=data))[1:total // dtype.itemsize + 1]
+            gpu = UOp.placeholder((total,), dtypes.uint8, device="NV")
+            with Context(HCQ_RUNTIME_DEV="CPU"), patch.object(type(Device), "__getitem__", lambda _, name: dev if name == "NV" else cpu):
+              linear = usb_stage_copy(gpu, host) if cin else usb_stage_copy(host, gpu)
+            copies = [u for u in linear.src if u.src[0].op is Ops.COPY]
+            self.assertEqual(len(copies), (total + batch - 1) // batch)
+            for i, copy in enumerate(copies):
+              staged = next(u for u in copy.toposort() if u.op is Ops.PARAM and u.tag == "usb_staging")
+              buf = Buffer("CPU", staged.numel(), staged.dtype, preallocate=True)
+              expected = payload[i * batch:(i + 1) * batch]
+              if not cin: buf.host.view()[:] = expected
+              copy = copy.substitute({staged: UOp.from_buffer(buf)})
+              exec_copy(ExecContext(), copy, copy.src[0])
+              if cin: self.assertEqual(bytes(buf.host.view()), expected)
+            self.assertEqual(bytes(data), b'\xa5' * dtype.itemsize + payload + b'\xa5' * dtype.itemsize)
+
+  def test_upload_batches_keep_markers_fixed_and_wait_before_reuse(self):
+    cpu, window, half = Device["CPU"], 256 << 10, 128 << 10
+    win = Mock(device="NV", dtype=dtypes.uint8, size=window, host=SimpleNamespace(addr=0x4f000))
+    dev = SimpleNamespace(pm_stage_copy=pm_usb_stage, usb_sram=win)
+    for chunks, counts in ((1, (1,)), (3, (3,)), (32, (32,)), (33, (32, 1))):
+      size = (chunks - 1) * (half - 512) + 3
+      with self.subTest(chunks=chunks), Context(HCQ_RUNTIME_DEV="CPU"), \
+           patch.object(type(Device), "__getitem__", lambda _, name: dev if name == "NV" else cpu), \
+           patch.object(nvusb, "usb_wait_value", wraps=nvusb.usb_wait_value) as waited:
+        linear = usb_stage_copy(UOp.placeholder((size,), dtypes.uint8, device="NV"),
+                                UOp.placeholder((size,), dtypes.uint8, device="CPU"))
+      submits = [u for u in linear.toposort() if u.op is Ops.CUSTOM_FUNCTION and u.arg == "submit_nv_copy"]
+      self.assertEqual(len(submits), len(counts))
+      self.assertEqual([c.args[1] for c in waited.call_args_list], [value for count in counts for value in (*range(1, count - 1), count)])
+      for submit, count in zip(submits, counts):
+        commands = submit.src[0].src
+        self.assertIs(commands[0].src[0], hcq2.timeline(("NV",)))
+        self.assertEqual(len(commands), 1 + 4 * count)
+        for i in range(count):
+          wait, copy, clear, release = commands[1 + 4 * i:5 + 4 * i]
+          self.assertEqual((wait.arg, wait.src[1].val), (("wait", dtypes.void), i + 1))
+          self.assertEqual(hcq2.unwrap_view(wait.src[0])[1], (i % 2 + 1) * half - 8)
+          self.assertIs(copy.src[0].op, Ops.COPY)
+          self.assertIs(clear.src[0], wait.src[0])
+          self.assertEqual(clear.src[1].val, 0)
+          self.assertEqual((release.src[0].tag, release.src[1].val), ("usb_readback_done", i + 1))
+      ends = [u for u in linear.toposort() if u.op is Ops.END]
+      self.assertEqual(len(ends), len({u.src[1] for u in ends}))
+
+  def test_uploads_share_host_staging_without_borrowing_runtime_ring_space(self):
+    dev, pad = object.__new__(ops_nv.NVDevice), object()
+    with patch.object(ops_nv, "Buffer", return_value=pad) as allocated:
+      for _ in range(300):
+        b = UOp.placeholder((256 << 10,), dtypes.uint8, device=("NV",), tag=("hcq_host", "usb_upload"))
+        self.assertIs(nvusb.pm_usb_bufferize.rewrite(b, ctx=dev), pad)
+        store = b.index(0).store(UOp.const(1, dtypes.uint8))
+        self.assertIs(graph_rewrite(store, pm_usb_hostio, walk=True), store)
+    allocated.assert_called_once_with("CPU", 256 << 10, dtypes.uint8, preallocate=True)
+
+  def test_sram_readback_bounds_batches_and_waits_for_each_host_ready(self):
+    cpu, window = Device["CPU"], 256 << 10
+    win = Mock(device="NV", dtype=dtypes.uint8, size=window, host=SimpleNamespace(addr=0x4f000))
+    dev = SimpleNamespace(pm_stage_copy=pm_usb_stage, usb_sram_readback=True, usb_sram=win)
+    for chunks, counts in ((2, (2,)), (64, (64,)), (65, (64, 1))):
+      size = (chunks - 1) * window + 3
+      with self.subTest(chunks=chunks), Context(HCQ_RUNTIME_DEV="CPU"), \
+           patch.object(type(Device), "__getitem__", lambda _, name: dev if name == "NV" else cpu):
+        linear = usb_stage_copy(UOp.placeholder((size,), dtypes.uint8, device="CPU"),
+                                UOp.placeholder((size,), dtypes.uint8, device="NV"))
+      submits = [u for u in linear.toposort() if u.op is Ops.CUSTOM_FUNCTION and u.arg == "submit_nv_copy"]
+      self.assertEqual(len(submits), len(counts))
+      for submit, count in zip(submits, counts):
+        commands = submit.src[0].src
+        self.assertEqual(len(commands), 1 + 3 * count)
+        self.assertIs(commands[0].src[0], hcq2.timeline(("NV",)))
+        for i in range(count):
+          wait, copy, release = commands[1 + 3 * i:4 + 3 * i]
+          self.assertEqual((wait.arg, wait.src[0].tag, wait.src[1].val), (("wait", dtypes.void), "usb_readback_done", i + 1))
+          self.assertIs(copy.src[0].op, Ops.COPY)
+          cq, offset = hcq2.unwrap_view(release.src[0])
+          self.assertEqual((release.arg, cq.tag, offset, release.src[1].val), (("store", dtypes.void), "usb_read_cq", 12, 0))
+
   def test_sram_readback_transfers_and_discards_slot_zero_prefix(self):
     cpu, window = Device["CPU"], 256 << 10
     win = Mock(device="NV", dtype=dtypes.uint8, size=window, host=SimpleNamespace(addr=0x4f000))
-    dev = SimpleNamespace(pm_stage_copy=pm_usb_stage, usb_sram_readback=True, usb_sram=win, usb_readback=win)
+    dev = SimpleNamespace(pm_stage_copy=pm_usb_stage, usb_sram_readback=True, usb_sram=win)
     for size, lengths in ((1, (262656,)), (4096, (266240,)), (window + 3, (524288, 262656))):
       arms, pulls = [], []
-      def arm(devs, read, nbytes, slot_start=0, deps=()):
-        arms.append((read, nbytes, slot_start))
-        return UOp.custom_function(f"test_arm_{len(arms)}")
+      def arm(devs, read, nbytes, slot_start=0, deps=(), *, idle=True):
+        node = UOp.custom_function(f"test_arm_{len(arms)}", *deps)
+        arms.append((read, nbytes, slot_start, idle, node))
+        return node
       def bulk(devs, deps, endpoint, data, length, timeout=1000):
-        pulls.append((deps[0], endpoint, length))
-        return UOp.custom_function(f"test_pull_{len(pulls)}", *deps)
+        node = UOp.custom_function(f"test_pull_{len(pulls)}", *deps)
+        pulls.append((endpoint, length, node))
+        return node
       with self.subTest(size=size), Context(HCQ_RUNTIME_DEV="CPU"), \
            patch.object(type(Device), "__getitem__", lambda _, name: dev if name == "NV" else cpu), \
            patch.object(nvusb, "usb_scsi", side_effect=arm), patch.object(nvusb, "usb_bulk", side_effect=bulk):
         linear = usb_stage_copy(UOp.placeholder((size,), dtypes.uint8, device="CPU"),
                                 UOp.placeholder((size,), dtypes.uint8, device="NV"))
-      self.assertIsNotNone(linear)
-      self.assertEqual(arms, [(True, length, 0) for length in lengths])
-      self.assertEqual([(endpoint, length) for _, endpoint, length in pulls], [(0x81, length) for length in lengths])
-      for i, ((submitted, _, length), host_copy) in enumerate(zip(pulls, linear.src[1::2])):
-        submit, armed = submitted.src
-        self.assertEqual(armed.arg, f"test_arm_{i + 1}")
-        commands = submit.src[0].src
-        self.assertIs(commands[0].src[0], hcq2.timeline(("NV",)))
-        self.assertIs(commands[0].src[1], hcq2.timeline_value(("NV",)))
-        self.assertIs(commands[1].src[0].op, Ops.COPY)
-        cq, offset = hcq2.unwrap_view(commands[2].src[0])
-        self.assertEqual((commands[2].arg, cq.tag, offset, commands[2].src[1].val),
-                         (("store", dtypes.void), "usb_read_cq", 12, 0))
-        pad, offset = hcq2.unwrap_view(host_copy.src[2])
-        self.assertEqual((offset, pad.nbytes()), (262144, length))
-        self.assertEqual(host_copy.src[2].nbytes(), min(window, size - i * window))
+      self.assertEqual([row[:4] for row in arms], [(True, length, 0, False) for length in lengths])
+      pulls = [row for row in pulls if row[1] > 8] # exclude the initial timeline read and 64-bit ready reset
+      self.assertEqual([row[:2] for row in pulls], [(0x81, length) for length in lengths])
+      copies = [u for u in linear.toposort() if u.op is Ops.CALL and u.src[0].op is Ops.CUSTOM_FUNCTION and u.src[0].arg == "memcpy"]
+      self.assertEqual(len(copies), len(lengths))
+      for i, copy in enumerate(copies):
+        self.assertIn(arms[i][-1], pulls[i][-1].toposort())
+        self.assertIn(pulls[i][-1], copy.toposort())
+        if i: self.assertIn(copies[i - 1], arms[i][-1].toposort())
+        source = copy.src[2]
+        self.assertIs(source.op, Ops.INDEX)
+        self.assertEqual(source.src[1].val, 262144)
+        self.assertEqual(copy.src[3].val, min(window, size - i * window))
 
   def test_sram_readback_is_opt_in_at_device_initialization(self):
     iface = object.__new__(ops_nv.USBIface)
@@ -121,6 +211,19 @@ class TestNVUSBIface(unittest.TestCase):
       current = hcq2.timeline_value(("CPU",))
       self.assertEqual(hcq2.timeline_submit_value(("CPU",)), current + UOp.const(-1, dtypes.uint64))
       self.assertIs(hcq2.timeline_submit_value(("CPU",), 1), current)
+
+  def test_usb_queue_entry_scratch_does_not_read_or_write_device_memory(self):
+    fifo = SimpleNamespace(entries=8, token=0)
+    queue = object.__new__(ops_nv.NVQueue)
+    queue.dev, queue.devs, queue.queue = SimpleNamespace(fifos={"COPY:0": fifo}), ("NV",), "COPY:0"
+    with Context(HCQ_RUNTIME_DEV="CPU"):
+      submitted = queue.submit(UOp.placeholder((4,), dtypes.uint32, device=("NV",), tag="cmdbuf_copy_0"))
+      entry = next(u for u in submitted.toposort() if u.op is Ops.PARAM and u.tag == "gpentry_copy_0")
+      load, store = entry.index(0).load(), entry.index(0).store(UOp.const(0x200000000004, dtypes.uint64))
+      for access in (load, store):
+        self.assertIs(graph_rewrite(access, pm_usb_hostio, walk=True), access)
+      ring = next(u for u in submitted.toposort() if u.op is Ops.PARAM and u.tag == "ring_copy_0")
+      self.assertIsNot(graph_rewrite(ring.index(0).store(load), pm_usb_hostio, walk=True), ring.index(0).store(load))
 
   def test_nv_usb_installs_hcq_transport(self):
     iface = object.__new__(ops_nv.USBIface)
