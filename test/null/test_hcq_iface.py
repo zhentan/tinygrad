@@ -207,9 +207,11 @@ class TestUSBPCITransfers(unittest.TestCase):
     window = Mock(device="NV", dtype=dtypes.uint8, size=0x40000, host=SimpleNamespace(addr=0x4f000))
     devices = {"NV": SimpleNamespace(pm_stage_copy=pm_usb_stage, usb_sram=window, usb_readback=window,
                                     has_copy_queue=True), "CPU": Device["CPU"]}
-    for src_device, dst_device, name in (("CPU", "NV", "hcq_copyin"), ("NV", "CPU", "hcq_copyout")):
+    for src_device, dst_device, name, sram in (("CPU", "NV", "hcq_copyin", False), ("NV", "CPU", "hcq_copyout", False),
+                                              ("NV", "CPU", "hcq_copyout", True)):
+      devices["NV"].usb_sram_readback = sram
       # Compiled matchers retain their globals, so patch lookup on the original Device object.
-      with self.subTest(name=name), patch.object(type(Device), "__getitem__", lambda _, device: devices[device]), \
+      with self.subTest(name=name, sram=sram), patch.object(type(Device), "__getitem__", lambda _, device: devices[device]), \
            patch.object(hcq2, "sched_batches", return_value=UOp(Ops.LINEAR)) as batch, patch.dict(hcq2.hcq_compile_cache, clear=True):
         for _ in range(2):
           # New inputs of the same shape must reuse the staged template.
@@ -217,6 +219,7 @@ class TestUSBPCITransfers(unittest.TestCase):
           hcq2.hcq_compile(UOp(Ops.LINEAR, src=(src.copy_to_device(dst.device).call(dst, src),)), [], False, cache=True)
         self.assertEqual(batch.call_count, 1)
       calls = batch.call_args.args[0].src
+      self.assertEqual(any(u.op is Ops.PARAM and u.tag == "usb_read_cq" for u in UOp.sink(*calls).toposort()), sram)
       self.assertEqual(sum(c.op is Ops.CALL and c.arg.name == name for c in calls), 1)
       for call in calls:
         if call.op is Ops.CALL and call.src[0].op is Ops.COPY:

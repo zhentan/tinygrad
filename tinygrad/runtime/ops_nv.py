@@ -16,7 +16,8 @@ from tinygrad.renderer.cstyle import CUDARenderer, NVCCRenderer
 from tinygrad.runtime.autogen import nv_570, nv_580, nv_610, mesa
 from tinygrad.runtime.support.elf import elf_loader
 from tinygrad.runtime.support.nv.nvdev import NVDev, NVNativeDev, NVMemoryManager
-from tinygrad.runtime.support.system import System, PCIIfaceBase, USBPCIDevice, MAP_FIXED
+from tinygrad.runtime.support.system import System, PCIIfaceBase, USBPCIDevice, PCIAllocationMeta, MAP_FIXED
+from tinygrad.runtime.support.memory import AddrSpace
 from tinygrad.runtime.support.usb import USB3
 from tinygrad.runtime.support.nv.usb import pm_usb_stage, pm_usb_hostio, pm_usb_bufferize
 from tinygrad.renderer.nir import NAKRenderer
@@ -672,6 +673,12 @@ class USBIface(PCIIface):
   def alloc_usb_sram(self, size:int) -> BufferStorage:
     return super().alloc(size, host=True, cpu_access=True, contiguous=True)
 
+  def alloc_usb_read_cq(self) -> BufferStorage:
+    # Completion releases use 0x828000; writes to 0x822000 do not release SRAM reads.
+    mapping = self.dev_impl.mm.map_range(vaddr:=self.dev_impl.mm.alloc_vaddr(0x1000, 0x1000), 0x1000, [(0x828000, 0x1000)],
+                                         aspace=AddrSpace.SYS, uncached=True)
+    return BufferStorage(vaddr, PCIAllocationMeta(mapping, has_cpu_mapping=False, hMemory=vaddr))
+
   def free(self, storage:BufferStorage):
     super().free(storage)
     self._native_memory.pop(storage.meta.hMemory, None)
@@ -701,6 +708,7 @@ class NVDevice(Compiled):
         raise BaseExceptionGroup("NV initialization and interface cleanup failed", [error, cleanup_error])
       raise
     if isinstance(self.iface, USBIface):
+      self.usb_sram_readback = bool(getenv("NV_USB_SRAM_READBACK", 0))
       self.pm_stage_copy = pm_usb_stage
       self.pm_lower = pm_usb_hostio
       self.pm_bufferize = pm_usb_bufferize + self.pm_bufferize
@@ -760,6 +768,11 @@ class NVDevice(Compiled):
   def usb_readback_done(self) -> Buffer:
     if not isinstance(self.iface, USBIface): raise RuntimeError("USB readback is only available through USBIface")
     return Buffer(self.device, 1, dtypes.uint64, options=BufferSpec(cpu_access=True, nolru=True), preallocate=True)
+
+  @functools.cached_property
+  def usb_read_cq(self) -> Buffer:
+    if not isinstance(self.iface, USBIface): raise RuntimeError("USB read completion is only available through USBIface")
+    return Buffer(self.device, 0x1000, dtypes.uint8, opaque=self.iface.alloc_usb_read_cq())
 
   @functools.cached_property
   def fifos(self) -> dict[str, GPFifo]:

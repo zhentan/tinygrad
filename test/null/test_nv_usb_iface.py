@@ -9,10 +9,83 @@ from tinygrad.runtime import ops_nv
 from tinygrad.runtime.support import hcq2
 from tinygrad.runtime.support.memory import AddrSpace
 from tinygrad.runtime.support.nv.usb import pm_usb_hostio, pm_usb_stage, usb_stage_copy
+from tinygrad.runtime.support.nv import usb as nvusb
 from tinygrad.uop.ops import Ops, PatternMatcher, UOp, graph_rewrite
 
 
 class TestNVUSBIface(unittest.TestCase):
+  def test_sram_readback_transfers_and_discards_slot_zero_prefix(self):
+    cpu, window = Device["CPU"], 256 << 10
+    win = Mock(device="NV", dtype=dtypes.uint8, size=window, host=SimpleNamespace(addr=0x4f000))
+    dev = SimpleNamespace(pm_stage_copy=pm_usb_stage, usb_sram_readback=True, usb_sram=win, usb_readback=win)
+    for size, lengths in ((1, (262656,)), (4096, (266240,)), (window + 3, (524288, 262656))):
+      arms, pulls = [], []
+      def arm(devs, read, nbytes, slot_start=0, deps=()):
+        arms.append((read, nbytes, slot_start))
+        return UOp.custom_function(f"test_arm_{len(arms)}")
+      def bulk(devs, deps, endpoint, data, length, timeout=1000):
+        pulls.append((deps[0], endpoint, length))
+        return UOp.custom_function(f"test_pull_{len(pulls)}", *deps)
+      with self.subTest(size=size), Context(HCQ_RUNTIME_DEV="CPU"), \
+           patch.object(type(Device), "__getitem__", lambda _, name: dev if name == "NV" else cpu), \
+           patch.object(nvusb, "usb_scsi", side_effect=arm), patch.object(nvusb, "usb_bulk", side_effect=bulk):
+        linear = usb_stage_copy(UOp.placeholder((size,), dtypes.uint8, device="CPU"),
+                                UOp.placeholder((size,), dtypes.uint8, device="NV"))
+      self.assertIsNotNone(linear)
+      self.assertEqual(arms, [(True, length, 0) for length in lengths])
+      self.assertEqual([(endpoint, length) for _, endpoint, length in pulls], [(0x81, length) for length in lengths])
+      for i, ((submitted, _, length), host_copy) in enumerate(zip(pulls, linear.src[1::2])):
+        submit, armed = submitted.src
+        self.assertEqual(armed.arg, f"test_arm_{i + 1}")
+        commands = submit.src[0].src
+        self.assertIs(commands[0].src[0], hcq2.timeline(("NV",)))
+        self.assertIs(commands[0].src[1], hcq2.timeline_value(("NV",)))
+        self.assertIs(commands[1].src[0].op, Ops.COPY)
+        cq, offset = hcq2.unwrap_view(commands[2].src[0])
+        self.assertEqual((commands[2].arg, cq.tag, offset, commands[2].src[1].val),
+                         (("store", dtypes.void), "usb_read_cq", 12, 0))
+        pad, offset = hcq2.unwrap_view(host_copy.src[2])
+        self.assertEqual((offset, pad.nbytes()), (262144, length))
+        self.assertEqual(host_copy.src[2].nbytes(), min(window, size - i * window))
+
+  def test_sram_readback_is_opt_in_at_device_initialization(self):
+    iface = object.__new__(ops_nv.USBIface)
+    def init_runtime(dev, _device): dev.pm_bufferize = PatternMatcher([])
+    for enabled in (0, 1):
+      with self.subTest(enabled=enabled), patch.object(ops_nv.NVDevice, "_select_iface", return_value=iface), \
+           patch.object(ops_nv.NVDevice, "_init_runtime", init_runtime), patch.object(ops_nv, "getenv", return_value=enabled):
+        dev = ops_nv.NVDevice("")
+      self.assertIs(dev.usb_sram_readback, bool(enabled))
+
+  def test_sram_readback_rejects_invalid_windows_before_arming(self):
+    cpu = Device["CPU"]
+    for address in (0xef00, 0x4f001, 0x53000):
+      win = Mock(device="NV", dtype=dtypes.uint8, size=256 << 10, host=SimpleNamespace(addr=address))
+      dev = SimpleNamespace(pm_stage_copy=pm_usb_stage, usb_sram_readback=True, usb_sram=win)
+      with self.subTest(address=address), patch.object(type(Device), "__getitem__", lambda _, name: dev if name == "NV" else cpu), \
+           patch.object(nvusb, "usb_scsi") as arm, self.assertRaisesRegex(RuntimeError, "USB SRAM"):
+        usb_stage_copy(UOp.placeholder((4096,), dtypes.uint8, device="CPU"), UOp.placeholder((4096,), dtypes.uint8, device="NV"))
+      arm.assert_not_called()
+
+  def test_sram_completion_mapping_does_not_own_vram_or_alias_memory_handles(self):
+    iface = object.__new__(ops_nv.USBIface)
+    iface.dev_impl = Mock()
+    iface.dev_impl.mm.alloc_vaddr.return_value = va = 0x1000000000
+    iface.dev_impl.mm.map_range.return_value = mapping = SimpleNamespace(aspace=AddrSpace.SYS)
+    iface._native_memory = {0: (sentinel:=object())}
+    cq = iface.alloc_usb_read_cq()
+    iface.dev_impl.mm.map_range.assert_called_once_with(va, 0x1000, [(0x828000, 0x1000)], aspace=AddrSpace.SYS, uncached=True)
+    self.assertEqual((cq.buf, cq.meta.mapping, cq.meta.has_cpu_mapping, cq.meta.hMemory, cq.host), (va, mapping, False, va, None))
+    iface.free(cq)
+    iface.dev_impl.mm.vfree.assert_not_called()
+    self.assertIs(iface._native_memory[0], sentinel)
+    dev = object.__new__(ops_nv.NVDevice)
+    dev.device, dev.iface = "NV", iface
+    with patch.object(iface, "alloc_usb_read_cq", return_value=cq) as alloc, patch.object(ops_nv, "Buffer", return_value=object()) as buffer:
+      self.assertIs(dev.usb_read_cq, dev.usb_read_cq)
+    alloc.assert_called_once_with()
+    buffer.assert_called_once_with("NV", 0x1000, dtypes.uint8, opaque=cq)
+
   def test_readback_waits_for_prior_compute_before_copying_each_chunk(self):
     cpu, window = Device["CPU"], 256 << 10
     dev = SimpleNamespace(pm_stage_copy=pm_usb_stage, usb_readback=Buffer("NV", window, dtypes.uint8))

@@ -1,4 +1,4 @@
-# Native NV uses reserved firmware SRAM and F0 readback; upstream USB batching has a different layout.
+# Native NV uses reserved firmware SRAM, with F0 readback by default and opt-in F2 DMA readback.
 import ctypes, functools, struct
 from typing import Any, cast
 from tinygrad.runtime.autogen import libusb
@@ -110,17 +110,19 @@ def usb_stage_copy(dst:UOp, src:UOp) -> UOp|None:
   if (cin:=is_usb_device(dst)) == is_usb_device(src): return None
 
   usb_dev = cast(Any, Device[(devs:=to_tuple((dst if cin else src).device))[0]])
-  win = usb_dev.usb_sram if cin else usb_dev.usb_readback
+  sram_readback = not cin and getattr(usb_dev, "usb_sram_readback", False) is True
+  win = usb_dev.usb_sram if cin or sram_readback else usb_dev.usb_readback
   # Stable scratch parameters let HCQ cache prepared copies; concrete inputs must not be retained.
   stage = _usb_stage_copy.__wrapped__ if any(u.op is Ops.BUFFER for u in UOp.sink(dst, src).toposort()) else _usb_stage_copy
-  return stage(dst, src, devs, win, cin)
+  return stage(dst, src, devs, win, cin, sram_readback)
 
 @functools.cache
-def _usb_stage_copy(dst:UOp, src:UOp, devs:tuple[str, ...], win:Buffer, cin:bool) -> UOp:
+def _usb_stage_copy(dst:UOp, src:UOp, devs:tuple[str, ...], win:Buffer, cin:bool, sram_readback:bool=False) -> UOp:
   total, ops = dst.nbytes(), []
-  if cin:
+  if cin or sram_readback:
     slot_start, slot_offset = divmod(win.host.addr - 0xf000, 0x4000)
     if slot_offset or not 0 <= slot_start <= 0xff: raise RuntimeError(f"invalid USB SRAM staging address {win.host.addr:#x}")
+    if sram_readback and slot_start * 0x4000 + win.size > 0x80000: raise RuntimeError("USB SRAM readback exceeds controller memory")
   for off in range(0, total, win.size): # off and nb are bytes, the two ends of the copy can have different dtypes
     stage = UOp.from_buffer(win)[0:(nb:=min(win.size, total - off))]
     s, d = src[off // src.dtype.itemsize:(off + nb) // src.dtype.itemsize], dst[off // dst.dtype.itemsize:(off + nb) // dst.dtype.itemsize]
@@ -133,6 +135,18 @@ def _usb_stage_copy(dst:UOp, src:UOp, devs:tuple[str, ...], win:Buffer, cin:bool
                       0x02, usb_address(s, 0), round_up(nb, 512), 10000)
       ops += [*prep, push.sink(arg=KernelInfo("hcq_copyin")).call(stage, s, name="hcq_copyin", aux=HCQInfo(devs)),
               stage.copy_to_device(d.device).call(d, stage)]
+    elif sram_readback:
+      # F2 releases from slot zero: transfer the reserved prefix and discard it on the host.
+      wire = round_up((prefix:=slot_start * 0x4000) + nb, 512)
+      pad = UOp.placeholder((wire,), dtypes.uint8, device="CPU", tag="usb_staging")
+      cq = UOp.placeholder((0x1000,), dtypes.uint8, device=devs, tag="usb_read_cq")
+      wait = UOp(Ops.INS, src=(timeline(devs), timeline_value(devs)), arg=("wait", dtypes.void))
+      release = UOp(Ops.INS, src=(cq[12:16].bitcast(dtypes.uint32), UOp.const(0, dtypes.uint32)), arg=("store", dtypes.void))
+      submit = make_submit(wait, s.copy_to_device(stage.device).call(stage, s), release, devs=devs, queue="COPY:0").after(
+        usb_scsi(devs, True, wire))
+      pull = usb_bulk(devs, (submit,), 0x81, usb_address(pad, 0), wire, 10000)
+      ops += [pull.sink(arg=KernelInfo("hcq_copyout")).call(pad, stage, s, name="hcq_copyout", aux=HCQInfo(devs)),
+              pad[prefix:prefix + nb].copy_to_device(d.device).call(d, pad[prefix:prefix + nb])]
     else:
       pad = UOp.placeholder((round_up(nb, 512),), dtypes.uint8, device="CPU", tag="usb_staging")[0:nb]
       done = UOp.placeholder((1,), dtypes.uint64, device=devs, tag="usb_readback_done")
@@ -164,4 +178,5 @@ def usb_handle_buffer(ctx:Any) -> Buffer:
 pm_usb_bufferize = PatternMatcher([
   (UPat(Ops.PARAM, tag="usb_handle"), usb_handle_buffer),
   (UPat(Ops.PARAM, tag="usb_readback_done"), lambda ctx: ctx.usb_readback_done),
+  (UPat(Ops.PARAM, tag="usb_read_cq"), lambda ctx: ctx.usb_read_cq),
 ])
