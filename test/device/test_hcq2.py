@@ -335,6 +335,56 @@ class TestHCQ2Link(unittest.TestCase):
 
 @unittest.skipUnless(isinstance(Device["CPU"].renderer, CStyleLanguage), "CALL is rendered in C style only")
 class TestHCQ2FFI(unittest.TestCase):
+  def test_usb_copy_commands_are_patched_before_upload_and_published_only_on_success(self):
+    from tinygrad.runtime import ops_nv
+    calls, result = [], {}
+    target = Buffer("CPU", 16, dtypes.uint8, preallocate=True)
+    fifo = Mock(entries=8, token=123, **{name:Buffer("CPU", size, dt, preallocate=True) for name, size, dt in
+      (("ring", 8, dtypes.uint64), ("gpput", 1, dtypes.uint32), ("doorbell", 1, dtypes.uint32), ("put_value", 1, dtypes.uint64))})
+    def control(handle, reqtype, request, value, index, data, length, timeout):
+      calls.append(("control", value, index, ctypes.string_at(data, length)))
+      return result['control']
+    def bulk(handle, endpoint, data, length, actual, timeout):
+      calls.append(("bulk", endpoint, length, ctypes.string_at(data, length)))
+      actual[0] = result['actual']
+      ctypes.memmove(target.get_buf("CPU"), data, min(length, actual[0]))
+      return result['bulk']
+    funcs = {fn.__name__: ctypes.CFUNCTYPE(fn.restype, *fn.argtypes)(stub)
+             for fn, stub in ((libusb.libusb_control_transfer, control), (libusb.libusb_bulk_transfer, bulk))}
+    ptrs = {name:Buffer("CPU", 1, dtypes.uint64, preallocate=True) for name in funcs}
+    for name, fn in funcs.items(): ptrs[name].host.view(fmt='Q')[0] = ctypes.cast(fn, ctypes.c_void_p).value
+    queue = object.__new__(ops_nv.NVCopyQueue)
+    queue.dev, queue.devs, queue.queue = Mock(iface=object.__new__(ops_nv.USBIface), fifos={"COPY:0":fifo}), ("CPU",), "COPY:0"
+    bind = ops_nv._queue_bufferizer(fifo, "COPY:0")
+    def bufferize(b, ctx):
+      if isinstance(b.tag, tuple) and b.tag[0] == "cfunc": return ptrs[b.tag[2]]
+      return target if b.tag == "command_target" else bind.rewrite(b, ctx=ctx)
+    with Context(HCQ_RUNTIME_DEV="CPU", DEBUG=0, PROFILE=0), patch.object(Device["CPU"].pm_bufferize, "rewrite", side_effect=bufferize):
+      ib = UOp.placeholder((16,), dtypes.uint8, device="CPU", tag="command_target")
+      value = UOp.variable("command_word", 0, 0xffff, dtypes.uint32, param=True)
+      # Upload the complete template while the ring points at only the requested command-buffer view.
+      linear = self._link(queue.submit(hcq2.patch(ib, [(4, value), (12, value + 1)], bytes([0xA5] * 16))[4:12]))
+      for word, control_rc, bulk_rc, actual in ((7,12,0,16), (9,-7,0,16), (11,12,-4,16), (13,12,0,15), (15,12,0,16)):
+        with self.subTest(word=word, control=control_rc, bulk=bulk_rc, actual=actual):
+          calls.clear()
+          result.update(control=control_rc, bulk=bulk_rc, actual=actual)
+          for b in (target, fifo.ring, fifo.gpput, fifo.doorbell, fifo.put_value): b.host.view(fmt='B')[:] = bytes(b.nbytes)
+          expected = struct.pack('<IIII', 0xA5A5A5A5, word, 0xA5A5A5A5, word + 1)
+          error = (control_rc, 12) if control_rc != 12 else (bulk_rc, 0) if bulk_rc else (actual, 16)
+          if error[0] == error[1]: run_linear(linear, {"command_word":word}, jit=True, wait=False)
+          else:
+            with self.assertRaisesRegex(RuntimeError, f"native call returned {error[0]}, expected {error[1]}"):
+              run_linear(linear, {"command_word":word}, jit=True, wait=False)
+          self.assertEqual([c[0] for c in calls], ["control"] if control_rc != 12 else ["control", "bulk"])
+          self.assertEqual(calls[0], ("control", 0xf60, 1, struct.pack('<QI', target.get_buf("CPU"), 4)))
+          if len(calls) == 2: self.assertEqual(calls[1], ("bulk", 0x02, 16, expected))
+          self.assertEqual(fifo.doorbell.host.view(fmt='I')[0], 123 if error[0] == error[1] else 0)
+          self.assertEqual(fifo.gpput.host.view(fmt='I')[0], 1 if error[0] == error[1] else 0)
+          self.assertEqual(fifo.put_value.host.view(fmt='Q')[0], 1 if error[0] == error[1] else 0)
+          if error[0] == error[1]:
+            self.assertEqual(bytes(target.host.view(fmt='B')), expected)
+            self.assertEqual(fifo.ring.host.view(fmt='Q')[0], target.get_buf("CPU") + (4 | (2 << 42) | (1 << 41)))
+
   @staticmethod
   def _link(body:UOp) -> UOp:
     call = hcq2.lower_call(UOp.sink(body, arg=KernelInfo("test_ffi")).call(aux=hcq2.HCQInfo(("CPU",))))
@@ -498,9 +548,9 @@ class TestHCQ2FFI(unittest.TestCase):
     addr = UOp.variable('usb_addr', 0, (1 << 36)-1, dtypes.uint64, param=True)
     with Context(HCQ_RUNTIME_DEV="CPU", DEBUG=0, PROFILE=0), patch.object(Device["CPU"].pm_bufferize, "rewrite",
       side_effect=lambda b, ctx: ptrs[b.tag[2]] if isinstance(b.tag, tuple) and b.tag[0] == "cfunc" else None):
-      for write in (False, True):
+      for write, nbytes in ((False, 4), (False, 8), (True, 8)):
         payload = UOp.placeholder((8,), dtypes.uint8, device="CPU", volatile=True, tag="usb_payload")
-        first = usb_stream(('CPU',), (), addr, payload.index(0), 8, write)
+        first = usb_stream(('CPU',), (), addr, payload.index(0), nbytes, write)
         second = usb_stream(('CPU',), (first,), addr + 16, payload.index(0), 4, True)
         marker = UOp.placeholder((1,), dtypes.uint32, device="CPU", volatile=True, tag="usb_marker")
         linear = self._link(marker.after(second).index(0).store(123))
@@ -510,19 +560,20 @@ class TestHCQ2FFI(unittest.TestCase):
         for ptr in ptrs.values(): self.assertIn(ptr, bufs)
         data = next(b for b in bufs if b.dtype is dtypes.uint8 and b.size == 8).host
         done = next(b for b in bufs if b.dtype is dtypes.uint32).host.view(fmt='I')
-        for control_rc, bulk_rc, actual in ((12, 0, 8), (-7, 0, 8), (11, 0, 8), (12, -4, 8), (12, 0, 0), (12, 0, 7), (12, 0, 9), (12, 0, 8)):
-          with self.subTest(write=write, control=control_rc, bulk=bulk_rc, actual=actual):
+        for control_rc, bulk_rc, actual in ((12, 0, nbytes), (-7, 0, nbytes), (11, 0, nbytes), (12, -4, nbytes),
+                                           (12, 0, 0), (12, 0, nbytes - 1), (12, 0, nbytes + 1), (12, 0, nbytes)):
+          with self.subTest(write=write, nbytes=nbytes, control=control_rc, bulk=bulk_rc, actual=actual):
             calls.clear()
             result.update(control=control_rc, bulk=bulk_rc, actual=actual)
             data[:], done[0] = b'abcdefgh', 0
-            error = (control_rc, 12) if control_rc != 12 else (bulk_rc, 0) if bulk_rc else (actual, 8)
+            error = (control_rc, 12) if control_rc != 12 else (bulk_rc, 0) if bulk_rc else (actual, nbytes)
             if error[0] == error[1]: run_linear(linear, {'usb_addr': 0x800000000}, jit=True, wait=False)
             else:
               with self.assertRaisesRegex(RuntimeError, f"native call returned {error[0]}, expected {error[1]}"):
                 run_linear(linear, {'usb_addr': 0x800000000}, jit=True, wait=False)
             self.assertEqual([c[0] for c in calls], ['control'] if control_rc != 12 else
                              ['control', 'bulk'] if error[0] != error[1] else ['control', 'bulk', 'control', 'bulk'])
-            self.assertEqual(calls[0], ('control', 0xf20 | (0x40 if write else 0), 1 if write else 2, bytes.fromhex('000000000800000002000000')))
+            self.assertEqual(calls[0], ('control', 0xf20 | (0x40 if write else 0), 1 if write else 2, struct.pack('<QI', 0x800000000, nbytes // 4)))
             self.assertEqual(done[0], 123 if error[0] == error[1] else 0)
             if error[0] == error[1]:
               self.assertEqual(calls[2], ('control', 0xf60, 1, bytes.fromhex('100000000800000001000000')))
@@ -534,10 +585,10 @@ class TestHCQ2FFI(unittest.TestCase):
           self.assertEqual([c[0] for c in calls], ['control', 'bulk', 'control', 'bulk'])
         calls.clear()
         with self.assertRaisesRegex(RuntimeError, "native call returned 1, expected 0"):
-          run_linear(linear, {'usb_addr': 0xfffffffc}, jit=True, wait=False)
+          run_linear(linear, {'usb_addr': 0x100000000 - nbytes + 1}, jit=True, wait=False)
         self.assertEqual(calls, [], "a stream crossing 4 GiB must fail before any USB request")
 
-  def test_ffi_usb_subdword_writes(self):
+  def test_ffi_usb_inline_writes(self):
     calls = []
     def control(handle, reqtype, request, value, index, data, length, timeout):
       calls.append(("control", value, index, ctypes.string_at(data, length)))
@@ -552,7 +603,7 @@ class TestHCQ2FFI(unittest.TestCase):
     for name, fn in funcs.items(): ptrs[name].host.view(fmt='Q')[0] = ctypes.cast(fn, ctypes.c_void_p).value
     with Context(HCQ_RUNTIME_DEV="CPU", DEBUG=0, PROFILE=0), patch.object(Device["CPU"].pm_bufferize, "rewrite",
       side_effect=lambda b, ctx: ptrs[b.tag[2]] if isinstance(b.tag, tuple) and b.tag[0] == "cfunc" else None):
-      for dt, index, value in ((dtypes.uint8, 3, 0xA5), (dtypes.uint16, 1, 0xBEEF)):
+      for dt, index, value in ((dtypes.uint8, 3, 0xA5), (dtypes.uint16, 1, 0xBEEF), (dtypes.uint32, 2, 0xFEDCBA98)):
         target = UOp.placeholder((8,), dt, device="CPU", tag="target")
         linear = self._link(usb_write_one(target, 0, (), ("CPU",), UOp.const(index), UOp.const(value, dt)))
         target_buf = next(u.buffer for u in linear.src[0].src[1:] if u.op is Ops.BUFFER and u.dtype is dt)

@@ -255,9 +255,9 @@ class TestUSBPCITransfers(unittest.TestCase):
     indices = UOp.stack(*[UOp.const(i, dtypes.int) for i in (1, 3, 5, 7)])
     values = UOp.stack(*[UOp.const(i, dtypes.uint32) for i in (10, 30, 50, 70)])
     rewritten = graph_rewrite(buf.index(indices).store(values), pm_usb_hostio, walk=True)
-    bulk_calls = [u for u in rewritten.toposort() if u.op is Ops.CALL and u.src[0].op is Ops.CUSTOM_FUNCTION
-                  and u.src[0].arg == "libusb_bulk_transfer"]
-    self.assertEqual(len(bulk_calls), 4)
+    usb_calls = [u.src[0].arg for u in rewritten.toposort() if u.op is Ops.CALL and u.src[0].op is Ops.CUSTOM_FUNCTION
+                 and str(u.src[0].arg).startswith("libusb_")]
+    self.assertEqual(usb_calls, ["libusb_control_transfer"] * 4)
 
   def test_xdata_bounds(self):
     controller = object.__new__(CustomASM24Controller)

@@ -20,7 +20,7 @@ from tinygrad.runtime.support.nv.nvdev import NVDev, NVNativeDev, NVMemoryManage
 from tinygrad.runtime.support.system import System, PCIIfaceBase, USBPCIDevice, PCIAllocationMeta, MAP_FIXED
 from tinygrad.runtime.support.memory import AddrSpace
 from tinygrad.runtime.support.usb import USB3
-from tinygrad.runtime.support.nv.usb import pm_usb_stage, pm_usb_hostio, pm_usb_bufferize
+from tinygrad.runtime.support.nv.usb import pm_usb_stage, pm_usb_hostio, pm_usb_bufferize, usb_stream, usb_address
 from tinygrad.renderer.nir import NAKRenderer
 if getenv("IOCTL"): import extra.nv_gpu_driver.nv_ioctl # noqa: F401 # pylint: disable=unused-import
 
@@ -196,16 +196,40 @@ class NVComputeQueue(NVQueue):
     self.prev_qmd = qmd
 
 class NVCopyQueue(NVQueue):
+  def __init__(self, ctx, submit):
+    super().__init__(ctx, submit)
+    # Track settings only within this command buffer; raw methods can overwrite them.
+    self.reuse_regs = isinstance(self.dev.iface, USBIface) and not any(u.op is Ops.INS and u.arg[0] == "nv" for u in self.lin.src)
+    self.copy_dst:UOp|None = None
+    self.copy_sem:tuple[UOp, UOp]|None = None
+
+  def submit(self, cmdbuf:UOp) -> UOp:
+    if isinstance(self.dev.iface, USBIface):
+      ib, off = unwrap_view(cmdbuf)
+      # COPY buffers have no embedded descriptors referring back to their own GPU address.
+      assert not any(u.op is Ops.GETADDR and unwrap_view(u.src[0])[0] is ib for u in cmdbuf.toposort())
+      host = UOp.placeholder((ib.nbytes(),), dtypes.uint8, device=HCQ_RUNTIME_DEV.value, tag="usb_commands")
+      copied = usb_stream(self.devs, (cmdbuf.substitute({ib:host}),), usb_address(ib, 0), host.index(0), ib.nbytes(), True)
+      cmdbuf = ib.after(copied)[off:off + cmdbuf.nbytes()]
+    return super().submit(cmdbuf)
+
   def copy(self, call:UOp):
     dest, src = (a.getaddr(self.devs) for a in call.src[1:3])
     for off in range(0, sz:=call.src[2].max_numel() * call.src[2].dtype.itemsize, step:=(1 << 31)):
-      self.nvm(4, nv_gpu.NVC6B5_OFFSET_IN_UPPER, *hilo(src + UOp.const(off, dtypes.uint64)), *hilo(dest + UOp.const(off, dtypes.uint64)))
+      target = dest + UOp.const(off, dtypes.uint64)
+      tail = () if self.reuse_regs and self.copy_dst is target else hilo(target)
+      self.nvm(4, nv_gpu.NVC6B5_OFFSET_IN_UPPER, *hilo(src + UOp.const(off, dtypes.uint64)), *tail)
+      self.copy_dst = target
       self.nvm(4, nv_gpu.NVC6B5_LINE_LENGTH_IN, min(sz - off, step))
       self.nvm(4, nv_gpu.NVC6B5_LAUNCH_DMA,
                nv_flags("NVC6B5_LAUNCH_DMA", data_transfer_type="non_pipelined", src_memory_layout="pitch", dst_memory_layout="pitch"))
 
   def semaphore(self, addr:UOp, value:UOp, typ:str): # a one word release writes just the payload, a four word one the timestamp after it
-    self.nvm(4, nv_gpu.NVC6B5_SET_SEMAPHORE_A, *hilo(addr), value.ccast(dtypes.uint32))
+    value = value.ccast(dtypes.uint32)
+    if not self.reuse_regs or self.copy_sem is None or self.copy_sem[0] is not addr:
+      self.nvm(4, nv_gpu.NVC6B5_SET_SEMAPHORE_A, *hilo(addr), value)
+    elif self.copy_sem[1] is not value: self.nvm(4, nv_gpu.NVC6B5_SET_SEMAPHORE_PAYLOAD, value)
+    self.copy_sem = (addr, value)
     self.nvm(4, nv_gpu.NVC6B5_LAUNCH_DMA, nv_flags("NVC6B5_LAUNCH_DMA", flush_enable="true", semaphore_type=f"release_{typ}_word_semaphore"))
   def timestamp(self, signal:UOp): self.semaphore(signal.getaddr(self.devs), UOp.const(0, dtypes.uint32), "four")
   def signal(self, signal:UOp, value:UOp): self.semaphore(signal.getaddr(self.devs), value, "one")

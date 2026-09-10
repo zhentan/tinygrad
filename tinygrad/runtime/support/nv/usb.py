@@ -56,7 +56,7 @@ def usb_load(b:UOp, idx:UOp, dt) -> UOp|None:
   devs = to_tuple(b.device)
   return got.after(usb_stream(devs, deps, addr, got.index(0), dt.itemsize, False)).index(0).load()
 
-def usb_write_subdword(devs:tuple[str, ...], deps:tuple[UOp, ...], addr:UOp, lane:UOp, v:UOp) -> UOp:
+def usb_write_inline(devs:tuple[str, ...], deps:tuple[UOp, ...], addr:UOp, lane:UOp, v:UOp) -> UOp:
   byte_en = (UOp.const((1 << v.dtype.itemsize) - 1, dtypes.int) << lane).cast(dtypes.int)
   payload = (v.cast(dtypes.uint32) << (lane * UOp.const(8, dtypes.int))).cast(dtypes.uint32)
   hdr = patch(UOp.placeholder((12,), dtypes.uint8, device=HCQ_RUNTIME_DEV.value, tag="usb_scratch"),
@@ -69,9 +69,9 @@ def usb_write_subdword(devs:tuple[str, ...], deps:tuple[UOp, ...], addr:UOp, lan
 def usb_write_one(base:UOp, offset:int, deps:tuple[UOp, ...], devs:tuple[str, ...], idx:UOp, v:UOp) -> UOp:
   idx_offset = idx * v.dtype.itemsize
   addr = usb_address(base, offset) + idx_offset.cast(dtypes.uint64)
-  if v.dtype.itemsize < 4:
+  if v.dtype.itemsize < 4 or (v.dtype.itemsize == 4 and offset % 4 == 0):
     lane = (idx_offset.cast(dtypes.int) + UOp.const(offset, dtypes.int)) & UOp.const(3, dtypes.int)
-    return usb_write_subdword(devs, deps, addr, lane, v)
+    return usb_write_inline(devs, deps, addr, lane, v)
   val = (s:=UOp.placeholder((1,), v.dtype, device=HCQ_RUNTIME_DEV.value, tag="usb_scratch")).after(s.index(0).store(v))
   return usb_stream(devs, deps, addr, val.index(0), v.dtype.itemsize, True)
 
@@ -170,14 +170,16 @@ def _usb_sram_upload(dst:UOp, src:UOp, devs:tuple[str, ...], win:Buffer, slot:in
   clear = usb_bulk(devs, (usb_scsi(devs, False, win.size, slot, deps=(zero,)),), 0x02, usb_address(pad, 0), win.size, 10000)
   reset = usb_write_one(done, 0, (clear,), devs, UOp.const(0), UOp.const(0, dtypes.uint64))
   sequence = make_submit(*commands, devs=devs, queue="COPY:0").after(reset)
+  # Batches count only to 32, and copy-engine releases write the low dword.
+  count = done.bitcast(dtypes.uint32)[0:1]
   for i, (off, nb) in enumerate(chunks):
-    if i >= 2: sequence = usb_wait_value(done, i - 1, (sequence,))
+    if i >= 2: sequence = usb_wait_value(count, i - 1, (sequence,))
     copied = ccall(libc.memcpy, pad.after(sequence).index(0), usb_address(host, off), UOp.const(nb, dtypes.uint64))
     # Fixed footer and wire size keep short tails from waiting on stale payload bytes.
     marker = pad.after(copied).bitcast(dtypes.uint64).index(half // 8 - 1).store(UOp.const(i + 1, dtypes.uint64))
     arm = usb_scsi(devs, False, half, slot + (i % 2) * (half // 0x4000), deps=(marker,), idle=False)
     sequence = usb_bulk(devs, (arm,), 0x02, usb_address(pad, 0), half, 10000)
-  wait = usb_wait_value(done, len(chunks), (sequence,))
+  wait = usb_wait_value(count, len(chunks), (sequence,))
   call = wait.sink(arg=KernelInfo("hcq_copyin")).call(dst, stage, host, name="hcq_copyin", aux=HCQInfo(devs))
   return UOp(Ops.LINEAR, src=(call,) if host is src else (src.copy_to_device("CPU").call(host, src), call))
 
