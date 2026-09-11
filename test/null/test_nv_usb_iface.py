@@ -280,23 +280,25 @@ class TestNVUSBIface(unittest.TestCase):
       arm.assert_not_called()
 
   def test_sram_completion_mapping_does_not_own_vram_or_alias_memory_handles(self):
-    iface = object.__new__(ops_nv.USBIface)
-    iface.dev_impl = Mock()
-    iface.dev_impl.mm.alloc_vaddr.return_value = va = 0x1000000000
-    iface.dev_impl.mm.map_range.return_value = mapping = SimpleNamespace(aspace=AddrSpace.SYS)
-    iface._native_memory = {0: (sentinel:=object())}
-    cq = iface.alloc_usb_read_cq()
-    iface.dev_impl.mm.map_range.assert_called_once_with(va, 0x1000, [(0x828000, 0x1000)], aspace=AddrSpace.SYS, uncached=True)
-    self.assertEqual((cq.buf, cq.meta.mapping, cq.meta.has_cpu_mapping, cq.meta.hMemory, cq.host), (va, mapping, False, va, None))
-    iface.free(cq)
-    iface.dev_impl.mm.vfree.assert_not_called()
-    self.assertIs(iface._native_memory[0], sentinel)
-    dev = object.__new__(ops_nv.NVDevice)
-    dev.device, dev.iface = "NV", iface
-    with patch.object(iface, "alloc_usb_read_cq", return_value=cq) as alloc, patch.object(ops_nv, "Buffer", return_value=object()) as buffer:
-      self.assertIs(dev.usb_read_cq, dev.usb_read_cq)
-    alloc.assert_called_once_with()
-    buffer.assert_called_once_with("NV", 0x1000, dtypes.uint8, opaque=cq)
+    for osx, cq_paddr in ((False, 0x828000), (True, 0x822000)):
+      with self.subTest(osx=osx), patch.object(ops_nv, "OSX", osx):
+        iface = object.__new__(ops_nv.USBIface)
+        iface.dev_impl = Mock()
+        iface.dev_impl.mm.alloc_vaddr.return_value = va = 0x1000000000
+        iface.dev_impl.mm.map_range.return_value = mapping = SimpleNamespace(aspace=AddrSpace.SYS)
+        iface._native_memory = {0: (sentinel:=object())}
+        cq = iface.alloc_usb_read_cq()
+        iface.dev_impl.mm.map_range.assert_called_once_with(va, 0x1000, [(cq_paddr, 0x1000)], aspace=AddrSpace.SYS, uncached=True)
+        self.assertEqual((cq.buf, cq.meta.mapping, cq.meta.has_cpu_mapping, cq.meta.hMemory, cq.host), (va, mapping, False, va, None))
+        iface.free(cq)
+        iface.dev_impl.mm.vfree.assert_not_called()
+        self.assertIs(iface._native_memory[0], sentinel)
+        dev = object.__new__(ops_nv.NVDevice)
+        dev.device, dev.iface = "NV", iface
+        with patch.object(iface, "alloc_usb_read_cq", return_value=cq) as alloc, patch.object(ops_nv, "Buffer", return_value=object()) as buffer:
+          self.assertIs(dev.usb_read_cq, dev.usb_read_cq)
+        alloc.assert_called_once_with()
+        buffer.assert_called_once_with("NV", 0x1000, dtypes.uint8, opaque=cq)
 
   def test_readback_waits_for_prior_compute_before_copying_each_chunk(self):
     cpu, window = Device["CPU"], 256 << 10

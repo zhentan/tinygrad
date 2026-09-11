@@ -699,8 +699,8 @@ class USBIface(PCIIface):
     return super().alloc(size, host=True, cpu_access=True, contiguous=True)
 
   def alloc_usb_read_cq(self) -> BufferStorage:
-    # Completion releases use 0x828000; writes to 0x822000 do not release SRAM reads.
-    mapping = self.dev_impl.mm.map_range(vaddr:=self.dev_impl.mm.alloc_vaddr(0x1000, 0x1000), 0x1000, [(0x828000, 0x1000)],
+    # The validated completion page differs between macOS and Linux hosts.
+    mapping = self.dev_impl.mm.map_range(vaddr:=self.dev_impl.mm.alloc_vaddr(0x1000, 0x1000), 0x1000, [(0x822000 if OSX else 0x828000, 0x1000)],
                                          aspace=AddrSpace.SYS, uncached=True)
     return BufferStorage(vaddr, PCIAllocationMeta(mapping, has_cpu_mapping=False, hMemory=vaddr))
 
