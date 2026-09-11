@@ -40,6 +40,7 @@ class MockASM24State:
 
     # PCI config space: (bus,dev,fn) -> bytearray(4096)
     self._pci_cfg: dict[tuple[int,int,int], bytearray] = {}
+    for bus in range(4): self._get_cfg(bus, 0, 0)[0x0e] = 1  # PCI-to-PCI bridge header
 
     # GPU BAR definitions: reg_offset -> (size, type_bits, is_64bit)
     self._gpu_bars: dict[int, tuple[int, int, bool]] = {
@@ -53,10 +54,12 @@ class MockASM24State:
 
     # Initialize GPU config space (bus=4, dev=0, fn=0) with BAR type bits and REBAR capability
     gpu_cfg = self._get_cfg(4, 0, 0)
+    struct.pack_into('<I', gpu_cfg, 0, 0x74a11002)  # same AMD device identity as the PCI mock
     for reg_off, (sz, type_bits, _) in self._gpu_bars.items():
       if sz > 0: struct.pack_into('<I', gpu_cfg, reg_off, type_bits)
     struct.pack_into('<I', gpu_cfg, 0x100, 0x15 | (1 << 16))  # REBAR cap header: id=0x15, version=1, next=0
     struct.pack_into('<I', gpu_cfg, 0x104, sum(1 << (i + 4) for i in range(10)))  # supported sizes up to 512MB
+    struct.pack_into('<I', gpu_cfg, 0x108, 1 << 5)  # one resizable BAR
 
   def _get_cfg(self, bus:int, dev:int, fn:int) -> bytearray:
     if (key:=(bus, dev, fn)) not in self._pci_cfg: self._pci_cfg[key] = bytearray(4096)

@@ -19,6 +19,8 @@ def checked(fn, msg=None):
   return wrapper
 
 class USB3:
+  BULK_WRITE_CHUNK_BYTES = 256 << 10
+
   @staticmethod
   @functools.cache
   def ctx():
@@ -41,6 +43,7 @@ class USB3:
     self._tags, self._transferred = itertools.count(1), ctypes.c_int(0)
     self._bulk_buf, self._bulk_mv = alloc_cbuffer(4 << 20)
     self._ctrl_buf, self._ctrl_mv = alloc_cbuffer(0x1000)
+    self._dma_buffers:list[tuple[c.POINTER[ctypes.c_ubyte], int]] = []
     # async bulk OUT state: tag -> (pooled transfer, keepalive payload mv); transfer errors latch into _async_err
     self._async_seq, self._async_err = itertools.count(1), 0
     self._async_pending: dict = {}
@@ -49,23 +52,39 @@ class USB3:
 
     self.handle = c.init_c_var(c.POINTER[libusb.struct_libusb_device_handle], lambda x: checked(libusb.libusb_open)(dev, x))
 
-    # Read product string descriptor
-    _buf = (ctypes.c_ubyte * 256)()
-    _desc = libusb.struct_libusb_device_descriptor()
-    checked(libusb.libusb_get_device_descriptor)(libusb.libusb_get_device(self.handle), ctypes.byref(_desc))
-    _ret = checked(libusb.libusb_get_string_descriptor_ascii)(self.handle, _desc.iProduct, _buf, 256)
-    self.product = bytes(_buf[:_ret]).decode("ascii", errors="replace")
-    assert self.product.startswith("custom") or self.product.startswith("AS2462")
+    try:
+      # Read product string descriptor
+      _buf = (ctypes.c_ubyte * 256)()
+      _desc = libusb.struct_libusb_device_descriptor()
+      checked(libusb.libusb_get_device_descriptor)(libusb.libusb_get_device(self.handle), ctypes.byref(_desc))
+      _ret = checked(libusb.libusb_get_string_descriptor_ascii)(self.handle, _desc.iProduct, _buf, 256)
+      self.product = bytes(_buf[:_ret]).decode("ascii", errors="replace")
+      assert self.product.startswith("custom") or self.product.startswith("AS2462")
 
-    # Detach kernel driver if needed
-    if checked(libusb.libusb_kernel_driver_active)(self.handle, 0):
-      checked(libusb.libusb_detach_kernel_driver)(self.handle, 0)
-      checked(libusb.libusb_reset_device)(self.handle)
+      # Detach kernel driver if needed
+      if checked(libusb.libusb_kernel_driver_active)(self.handle, 0):
+        checked(libusb.libusb_detach_kernel_driver)(self.handle, 0)
+        checked(libusb.libusb_reset_device)(self.handle)
 
-    # Set configuration and claim interface
-    checked(libusb.libusb_set_configuration)(self.handle, 1)
-    checked(libusb.libusb_claim_interface)(self.handle, 0)
-    checked(libusb.libusb_set_interface_alt_setting)(self.handle, 0, 0)
+      # Set configuration and claim interface
+      checked(libusb.libusb_set_configuration)(self.handle, 1)
+      checked(libusb.libusb_claim_interface)(self.handle, 0)
+      checked(libusb.libusb_set_interface_alt_setting)(self.handle, 0, 0)
+    except BaseException:
+      libusb.libusb_close(self.handle)
+      self.handle = type(self.handle)()
+      raise
+
+  def alloc_dma(self, size:int) -> memoryview:
+    if not (ptr:=libusb.libusb_dev_mem_alloc(self.handle, size)): raise RuntimeError(f"USB DMA allocation failed for {size} bytes")
+    self._dma_buffers.append((ptr, size))
+    return to_mv(ctypes.addressof(ptr.contents), size)
+
+  def free_dma_buffers(self): # callers must finish all transfers before releasing their staging memory
+    while self._dma_buffers:
+      ptr, size = self._dma_buffers[-1]
+      checked(libusb.libusb_dev_mem_free)(self.handle, ptr, size)
+      self._dma_buffers.pop()
 
   def control_write(self, request:int, value:int=0, index:int=0, data:bytes=b'', timeout:int=1000):
     assert len(data) <= len(self._ctrl_mv)
@@ -78,11 +97,14 @@ class USB3:
     return self._ctrl_mv[:length]
 
   def bulk_write(self, payload:bytes, timeout:int=1000):
-    if len(payload) > len(self._bulk_mv): self._bulk_buf, self._bulk_mv = alloc_cbuffer(len(payload))
-    self._bulk_mv[:len(payload)] = payload
-    checked(libusb.libusb_bulk_transfer, "bulk OUT 0x02 failed") \
-      (self.handle, 0x02, self._bulk_buf, len(payload), self._transferred, timeout)
-    assert self._transferred.value == len(payload), f"bulk OUT short write: {self._transferred.value}/{len(payload)} bytes"
+    source = memoryview(payload)
+    chunk_bytes = min(self.BULK_WRITE_CHUNK_BYTES, len(self._bulk_mv))
+    for offset in range(0, len(source), chunk_bytes):
+      length = min(chunk_bytes, len(source) - offset)
+      self._bulk_mv[:length] = source[offset:offset + length]
+      checked(libusb.libusb_bulk_transfer, "bulk OUT 0x02 failed") \
+        (self.handle, 0x02, self._bulk_buf, length, self._transferred, timeout)
+      assert self._transferred.value == length, f"bulk OUT short write: {self._transferred.value}/{length} bytes"
 
   def _on_bulk_done(self, xfer):  # runs in libusb event handling; latch errors (exceptions here are unraisable)
     exp = xfer.contents.length - 8 if xfer.contents.type == libusb.LIBUSB_TRANSFER_TYPE_CONTROL else xfer.contents.length
@@ -123,6 +145,7 @@ class USB3:
   def bulk_read(self, length:int, timeout:int=1000) -> memoryview:
     if length > len(self._bulk_mv): self._bulk_buf, self._bulk_mv = alloc_cbuffer(length)
     checked(libusb.libusb_bulk_transfer, "bulk IN 0x81 failed")(self.handle, 0x81, self._bulk_buf, length, self._transferred, timeout)
+    assert self._transferred.value == length, f"bulk IN short read: {self._transferred.value}/{length} bytes"
     return self._bulk_mv[:self._transferred.value]
 
   # NOTE: keep it for flash.py
@@ -186,17 +209,20 @@ class CustomASM24Controller:
     """Streaming PCIe memory write via 0xF0 mode 1 + bulk OUT. Data is little-endian dwords on the wire."""
     if not data: return
     assert len(data) % 4 == 0, f"pcie_mem_write requires 4-byte aligned size, got {len(data)}"
-    self._f0_out(0x60, 0x0F, address, len(data) // 4, mode=1)
+    assert address >= (1 << 32) or address + len(data) <= (1 << 32), "PCIe stream crosses 4 GiB"
+    self._f0_out(0x60 if address >> 32 else 0x40, 0x0F, address, len(data) // 4, mode=1)
     self.usb.bulk_write(data)
 
   def pcie_mem_read(self, address:int, nbytes:int) -> memoryview:
     """Streaming PCIe memory read via 0xF0 mode 2 + bulk IN. Returns little-endian bytes."""
     assert nbytes % 4 == 0, f"pcie_mem_read requires 4-byte aligned size, got {nbytes}"
-    self._f0_out(0x20, 0x0F, address, nbytes // 4, mode=2)
+    assert address >= (1 << 32) or address + nbytes <= (1 << 32), "PCIe stream crosses 4 GiB"
+    self._f0_out(0x20 if address >> 32 else 0, 0x0F, address, nbytes // 4, mode=2)
     return self.usb.bulk_read(nbytes, timeout=30000)
 
   def read(self, base_addr:int, length:int) -> bytes:
     """Read from chip XDATA via vendor control IN (bRequest=0xE4). wValue=addr, wLength=size."""
+    assert 0 <= base_addr <= base_addr + length <= 0x10000, "XDATA range outside 16-bit address space"
     result = b''
     for off in range(0, length, 0xFF):
       chunk = min(0xFF, length - off)
@@ -205,6 +231,7 @@ class CustomASM24Controller:
 
   def write(self, base_addr:int, data:bytes):
     """Write to chip XDATA via vendor control OUT (bRequest=0xE5). wValue=addr, wIndex=val."""
+    assert 0 <= base_addr <= base_addr + len(data) <= 0x10000, "XDATA range outside 16-bit address space"
     for off, val in enumerate(data): self.usb.control_write(0xE5, value=base_addr + off, index=val)
 
   def scsi_write(self, buf:bytes, slot_start:int=0):
@@ -233,16 +260,23 @@ class USBMMIOInterface(MMIOInterface):
       assert sz % 4 == 0 and off % 4 == 0, f"pcie_mem_read requires 4-byte aligned access, got off={off}, sz={sz}"
       data = self.usb.pcie_mem_read(self.addr + off, sz)
     else: data = self.usb.scsi_read(sz) if self.addr == 0xf000 else self.usb.read(self.addr + off, sz)
-    return data if isinstance(index, slice) else int.from_bytes(data, "little")
+    if isinstance(index, slice): return data if self.fmt == 'B' else memoryview(data).cast(self.fmt).tolist()
+    return int.from_bytes(data, "little")
 
   def __setitem__(self, index, data):
     off, _ = self._off_from_index(index)
     data = struct.pack(self.fmt, data) if isinstance(data, int) else bytes(data)
     if not self.pcimem: self.usb.scsi_write(data) if self.addr == 0xf000 else self.usb.write(self.addr + off, data)
     else:
-      # writes are whole dwords
-      assert len(data) % 4 == 0 and off % 4 == 0, f"pcie_mem_write requires 4-byte aligned access, got off={off}, sz={len(data)}"
-      self.usb.pcie_mem_write(self.addr+off, data)
+      address, pos = self.addr + off, 0
+      assert address >= (1 << 32) or address + len(data) <= (1 << 32), "PCIe stream crosses 4 GiB"
+      while pos < len(data):
+        if (addr:=address + pos) % 4 == 0 and (size:=(len(data) - pos) // 4 * 4):
+          self.usb.pcie_mem_write(addr, data[pos:pos + size])
+        else:
+          size = min(4 - (addr & 3), len(data) - pos)
+          self.usb.pcie_request(0x60 if addr >> 32 else 0x40, addr, int.from_bytes(data[pos:pos + size], "little"), size)
+        pos += size
 
   def view(self, offset:int=0, size:int|None=None, fmt=None):
     return USBMMIOInterface(self.usb, self.addr+offset, self.nbytes-offset if size is None else size, fmt=fmt or self.fmt, pcimem=self.pcimem)

@@ -3,7 +3,8 @@ import os, ctypes, contextlib, re, functools, mmap, struct, array, sys, itertool
 assert sys.platform != 'win32'
 from typing import Any
 from dataclasses import dataclass, replace
-from tinygrad.runtime.support.hcq2 import HWQueue, encode_submit, patch, to_name, unwrap_view, make_submit, timeline, HCQInfo, lower_call, hcq_link
+from tinygrad.runtime.support.hcq2 import HWQueue, encode_submit, patch, to_name, unwrap_view
+from tinygrad.runtime.support.hcq2 import make_submit, timeline, HCQInfo, HCQ_RUNTIME_DEV, lower_call, hcq_link
 from tinygrad.runtime.support.hcq import MMIOInterface, FileIOInterface, BumpAllocator, hcq_filter_visible_devices
 from tinygrad.uop.ops import Ops, UOp, UPat, PatternMatcher, KernelInfo
 from tinygrad.engine.realize import get_call_arg_uops, get_call_var_uops, lower_and_compile, run_linear
@@ -15,8 +16,11 @@ from tinygrad.renderer.ptx import PTXRenderer
 from tinygrad.renderer.cstyle import CUDARenderer, NVCCRenderer
 from tinygrad.runtime.autogen import nv_570, nv_580, nv_610, mesa
 from tinygrad.runtime.support.elf import elf_loader
-from tinygrad.runtime.support.nv.nvdev import NVDev, NVMemoryManager
-from tinygrad.runtime.support.system import PCIIfaceBase, MAP_FIXED
+from tinygrad.runtime.support.nv.nvdev import NVDev, NVNativeDev, NVMemoryManager
+from tinygrad.runtime.support.system import PCIIfaceBase, USBPCIDevice, PCIAllocationMeta, MAP_FIXED
+from tinygrad.runtime.support.memory import AddrSpace
+from tinygrad.runtime.support.usb import USB3
+from tinygrad.runtime.support.nv.usb import pm_usb_stage, pm_usb_hostio, pm_usb_bufferize, usb_stream, usb_address
 from tinygrad.renderer.nir import NAKRenderer
 if getenv("IOCTL"): import extra.nv_gpu_driver.nv_ioctl # noqa: F401 # pylint: disable=unused-import
 
@@ -93,6 +97,14 @@ class QMD:
 # *****************
 # queues
 
+def _queue_tag(name:str, queue:str):
+  tag = to_name(name, queue)
+  return ("hcq_host", tag) if name == "put_value" else tag
+
+def _queue_bufferizer(fifo, name:str) -> PatternMatcher:
+  return PatternMatcher([(UPat(Ops.PARAM, tag={_queue_tag(n, name)}), lambda ctx, b=getattr(fifo, n): b)
+                         for n in ("ring", "gpput", "doorbell", "put_value")])
+
 class NVQueue(HWQueue):
   dev:NVDevice
   q_rewrite = HWQueue.q_rewrite + PatternMatcher([
@@ -114,7 +126,8 @@ class NVQueue(HWQueue):
   def submit(self, cmdbuf:UOp) -> UOp:
     fifo, ib, off = self.dev.fifos[self.queue], *unwrap_view(cmdbuf)
 
-    ring, gpput, doorbell, put, gpentry = [UOp.placeholder((sz,), dt, device=self.devs, volatile=True, tag=to_name(nm, self.queue))
+    ring, gpput, doorbell, put, gpentry = [UOp.placeholder((sz,), dt, device=HCQ_RUNTIME_DEV.value if nm == "gpentry" else self.devs,
+                                                        volatile=True, tag=_queue_tag(nm, self.queue))
       for nm, dt, sz in (("ring", dtypes.uint64, fifo.entries), ("gpput", dtypes.uint32, 1), ("doorbell", dtypes.uint32, 1),
                          ("put_value", dtypes.uint64, 1), ("gpentry", dtypes.uint64, 1))]
     gpentry = patch(gpentry, [(0, ib.getaddr(self.devs) + UOp.const(off | (cmdbuf.max_numel() // 4 << 42) | (1 << 41), dtypes.uint64))])
@@ -183,16 +196,40 @@ class NVComputeQueue(NVQueue):
     self.prev_qmd = qmd
 
 class NVCopyQueue(NVQueue):
+  def __init__(self, ctx, submit):
+    super().__init__(ctx, submit)
+    # Track settings only within this command buffer; raw methods can overwrite them.
+    self.reuse_regs = isinstance(self.dev.iface, USBIface) and not any(u.op is Ops.INS and u.arg[0] == "nv" for u in self.lin.src)
+    self.copy_dst:UOp|None = None
+    self.copy_sem:tuple[UOp, UOp]|None = None
+
+  def submit(self, cmdbuf:UOp) -> UOp:
+    if isinstance(self.dev.iface, USBIface):
+      ib, off = unwrap_view(cmdbuf)
+      # COPY buffers have no embedded descriptors referring back to their own GPU address.
+      assert not any(u.op is Ops.GETADDR and unwrap_view(u.src[0])[0] is ib for u in cmdbuf.toposort())
+      host = UOp.placeholder((ib.nbytes(),), dtypes.uint8, device=HCQ_RUNTIME_DEV.value, tag="usb_commands")
+      copied = usb_stream(self.devs, (cmdbuf.substitute({ib:host}),), usb_address(ib, 0), host.index(0), ib.nbytes(), True)
+      cmdbuf = ib.after(copied)[off:off + cmdbuf.nbytes()]
+    return super().submit(cmdbuf)
+
   def copy(self, call:UOp):
     dest, src = (a.getaddr(self.devs) for a in call.src[1:3])
     for off in range(0, sz:=call.src[2].max_numel() * call.src[2].dtype.itemsize, step:=(1 << 31)):
-      self.nvm(4, nv_gpu.NVC6B5_OFFSET_IN_UPPER, *hilo(src + UOp.const(off, dtypes.uint64)), *hilo(dest + UOp.const(off, dtypes.uint64)))
+      target = dest + UOp.const(off, dtypes.uint64)
+      tail = () if self.reuse_regs and self.copy_dst is target else hilo(target)
+      self.nvm(4, nv_gpu.NVC6B5_OFFSET_IN_UPPER, *hilo(src + UOp.const(off, dtypes.uint64)), *tail)
+      self.copy_dst = target
       self.nvm(4, nv_gpu.NVC6B5_LINE_LENGTH_IN, min(sz - off, step))
       self.nvm(4, nv_gpu.NVC6B5_LAUNCH_DMA,
                nv_flags("NVC6B5_LAUNCH_DMA", data_transfer_type="non_pipelined", src_memory_layout="pitch", dst_memory_layout="pitch"))
 
   def semaphore(self, addr:UOp, value:UOp, typ:str): # a one word release writes just the payload, a four word one the timestamp after it
-    self.nvm(4, nv_gpu.NVC6B5_SET_SEMAPHORE_A, *hilo(addr), value.ccast(dtypes.uint32))
+    value = value.ccast(dtypes.uint32)
+    if not self.reuse_regs or self.copy_sem is None or self.copy_sem[0] is not addr:
+      self.nvm(4, nv_gpu.NVC6B5_SET_SEMAPHORE_A, *hilo(addr), value)
+    elif self.copy_sem[1] is not value: self.nvm(4, nv_gpu.NVC6B5_SET_SEMAPHORE_PAYLOAD, value)
+    self.copy_sem = (addr, value)
     self.nvm(4, nv_gpu.NVC6B5_LAUNCH_DMA, nv_flags("NVC6B5_LAUNCH_DMA", flush_enable="true", semaphore_type=f"release_{typ}_word_semaphore"))
   def timestamp(self, signal:UOp): self.semaphore(signal.getaddr(self.devs), UOp.const(0, dtypes.uint32), "four")
   def signal(self, signal:UOp, value:UOp): self.semaphore(signal.getaddr(self.devs), value, "one")
@@ -531,7 +568,9 @@ class PCIIface(PCIIfaceBase):
     if NVKIface.root is not None: raise RuntimeError("Cannot use PCIIface after NVKIface has been initialized (would corrupt UVM memory)")
     super().__init__(dev, dev_id, vendor=0x10de, devices=((0xff00, (0x2200,0x2400,0x2500,0x2600,0x2700,0x2800,0x2b00,0x2c00,0x2d00,0x2f00)),),
       base_class=0x03, vram_bar=1, va_start=NVMemoryManager.va_allocator.base, va_size=NVMemoryManager.va_allocator.size, dev_impl_t=NVDev)
+    self._setup_nv()
 
+  def _setup_nv(self):
     self.root, self.gpu_instance = 0xc1000000, 0
     self.rm_alloc(0, nv_gpu.NV01_ROOT, nv_gpu.NV0000_ALLOC_PARAMETERS())
 
@@ -552,10 +591,136 @@ class PCIIface(PCIIfaceBase):
     for _ in self.dev_impl.gsp.stat_q.read_resp(): pass
     if self.dev_impl.is_err_state: raise RuntimeError("Device fault detected")
 
+class USBIface(PCIIface):
+  def __init__(self, dev, dev_id): # pylint: disable=super-init-not-called
+    if NVKIface.root is not None: raise RuntimeError("Cannot use USBIface after NVKIface has been initialized (would corrupt UVM memory)")
+    if dev_id >= len(visible:=hcq_filter_visible_devices(USB3.list_devices(0x3801, 0x0001), "NV")):
+      raise RuntimeError(f"NV:{dev_id} does not exist ({len(visible)} devices available)")
+    self.dev, self.pci_dev, self.vram_bar, self.count = dev, USBPCIDevice("NV", *visible[dev_id]), 1, len(visible)
+    try:
+      self.dev_impl = NVNativeDev(self.pci_dev)
+      self._setup_native_nv()
+    except BaseException as error:
+      try: self.pci_dev.reset()
+      except BaseException as cleanup_error:
+        raise BaseExceptionGroup("NV USB initialization and device reset failed", [error, cleanup_error])
+      raise
+
+  def _setup_native_nv(self):
+    self.root, self.gpu_instance = 0xc1000000, 0
+    self.gpfifo_class, self.compute_class = nv_gpu.AMPERE_CHANNEL_GPFIFO_A, nv_gpu.AMPERE_COMPUTE_B
+    self.dma_class, self.viddec_class = nv_gpu.AMPERE_DMA_COPY_B, None
+    self._native_handles, self._native_objects = itertools.count(0xc2000000), {self.root:nv_gpu.NV01_ROOT}
+    self._native_parents, self._native_memory, self._native_channels = {self.root:0}, {}, {}
+
+  def rm_alloc(self, parent, clss, params=None, root=None) -> int:
+    parent_classes = {
+      nv_gpu.NV01_DEVICE_0:nv_gpu.NV01_ROOT, nv_gpu.NV20_SUBDEVICE_0:nv_gpu.NV01_DEVICE_0,
+      nv_gpu.NV01_MEMORY_VIRTUAL:nv_gpu.NV01_DEVICE_0, nv_gpu.FERMI_VASPACE_A:nv_gpu.NV01_DEVICE_0,
+      nv_gpu.KEPLER_CHANNEL_GROUP_A:nv_gpu.NV01_DEVICE_0, nv_gpu.FERMI_CONTEXT_SHARE_A:nv_gpu.KEPLER_CHANNEL_GROUP_A,
+      nv_gpu.AMPERE_CHANNEL_GPFIFO_A:nv_gpu.KEPLER_CHANNEL_GROUP_A, nv_gpu.AMPERE_COMPUTE_B:nv_gpu.AMPERE_CHANNEL_GPFIFO_A,
+      nv_gpu.AMPERE_DMA_COPY_B:nv_gpu.AMPERE_CHANNEL_GPFIFO_A, nv_gpu.GT200_DEBUGGER:nv_gpu.NV01_DEVICE_0,
+    }
+    if clss not in parent_classes: raise RuntimeError(f"native NV class {clss:#x} allocation is not implemented")
+    if root not in (None, self.root): raise RuntimeError(f"native NV allocation used unknown root {root:#x}")
+    if self._native_objects.get(parent) != parent_classes[clss]:
+      raise RuntimeError(f"native NV class {clss:#x} has invalid parent {parent:#x}")
+    if clss == nv_gpu.GT200_DEBUGGER:
+      if not isinstance(params, nv_gpu.NV83DE_ALLOC_PARAMETERS) or params.hDebuggerClient_Obsolete or params.hAppClient != self.root or \
+         self._native_objects.get(params.hClass3dObject) != nv_gpu.AMPERE_COMPUTE_B:
+        raise RuntimeError("native NV debugger allocation has invalid parameters")
+    if clss == nv_gpu.AMPERE_CHANNEL_GPFIFO_A:
+      if not isinstance(params, nv_gpu.NV_CHANNELGPFIFO_ALLOCATION_PARAMETERS):
+        raise RuntimeError("native Ampere channel allocation has invalid parameters")
+      if self._native_objects.get(params.hContextShare) != nv_gpu.FERMI_CONTEXT_SHARE_A or \
+         self._native_parents.get(params.hContextShare) != parent:
+        raise RuntimeError(f"native Ampere channel has invalid context share {params.hContextShare:#x}")
+      if params.engineType != 0 or params.flags or params.hVASpace:
+        raise RuntimeError("native Ampere channel requested unsupported engine, flags, or VASpace override")
+      if any(params.hUserdMemory[index] or params.userdOffset[index] for index in range(1, 8)):
+        raise RuntimeError("native Ampere channel requested unsupported subdevice USERD memory")
+      if (memory:=self._native_memory.get(params.hObjectBuffer)) is None or params.hUserdMemory[0] != params.hObjectBuffer:
+        raise RuntimeError("native Ampere channel GPFIFO or USERD memory is unknown")
+      gpfifo_offset, entries = int(params.gpFifoOffset), int(params.gpFifoEntries)
+      offset, userd_offset = gpfifo_offset - int(memory.buf), int(params.userdOffset[0])
+      if offset < 0 or entries <= 0 or offset + entries * 8 > memory.meta.mapping.size or \
+         userd_offset < 0 or userd_offset + 0x200 > memory.meta.mapping.size:
+        raise RuntimeError("native Ampere channel GPFIFO or USERD range is invalid")
+      channel = self.dev_impl.alloc_channel(gpfifo_offset, entries, params.hObjectBuffer + userd_offset)
+    if clss == nv_gpu.AMPERE_COMPUTE_B:
+      if (channel:=self._native_channels.get(parent)) is None: raise RuntimeError("native Ampere compute channel is unknown")
+      self.dev_impl.gr.bind_compute_context(channel)
+    if clss == nv_gpu.AMPERE_DMA_COPY_B:
+      if (channel:=self._native_channels.get(parent)) is None: raise RuntimeError("native Ampere copy channel is unknown")
+      self.dev_impl.bind_copy_context(channel)
+    self._native_objects[handle:=next(self._native_handles)] = clss
+    self._native_parents[handle] = parent
+    if clss == nv_gpu.AMPERE_CHANNEL_GPFIFO_A: self._native_channels[handle] = channel
+    return handle
+
+  def rm_control(self, obj, cmd, params=None, **kwargs):
+    if self._native_objects.get(obj) == nv_gpu.AMPERE_CHANNEL_GPFIFO_A and cmd == nv_gpu.NVC36F_CTRL_CMD_GPFIFO_GET_WORK_SUBMIT_TOKEN:
+      if not isinstance(params, nv_gpu.NVC36F_CTRL_CMD_GPFIFO_GET_WORK_SUBMIT_TOKEN_PARAMS):
+        raise RuntimeError("native Ampere channel token control has invalid parameters")
+      params.workSubmitToken = self._native_channels[obj].token
+      return params
+    if self._native_objects.get(obj) == nv_gpu.KEPLER_CHANNEL_GROUP_A and cmd == nv_gpu.NVA06C_CTRL_CMD_GPFIFO_SCHEDULE:
+      if not isinstance(params, nv_gpu.NVA06C_CTRL_GPFIFO_SCHEDULE_PARAMS) or params.bEnable != 1 or params.bSkipSubmit:
+        raise RuntimeError("native Ampere channel group requested an unsupported schedule operation")
+      channels = [channel for handle, channel in self._native_channels.items() if self._native_parents.get(handle) == obj]
+      self.dev_impl.schedule_channel_group(channels)
+      return params
+    if self._native_objects.get(obj) != nv_gpu.NV20_SUBDEVICE_0:
+      raise RuntimeError(f"native NV control {cmd:#x} used unknown subdevice {obj:#x}")
+    if cmd == nv_gpu.NV2080_CTRL_CMD_PERF_BOOST: return params
+    if cmd == nv_gpu.NV2080_CTRL_CMD_INTERNAL_STATIC_KGR_GET_INFO:
+      if not isinstance(params, nv_gpu.NV2080_CTRL_INTERNAL_STATIC_KGR_GET_INFO_PARAMS):
+        raise RuntimeError("native GA102 info control has invalid parameters")
+      info = {
+        nv_gpu.NV2080_CTRL_GR_INFO_INDEX_SM_VERSION:nv_gpu.NV2080_CTRL_GR_INFO_SM_VERSION_8_06,
+        nv_gpu.NV2080_CTRL_GR_INFO_INDEX_MAX_WARPS_PER_SM:48,
+        nv_gpu.NV2080_CTRL_GR_INFO_INDEX_LITTER_NUM_GPCS:7,
+        nv_gpu.NV2080_CTRL_GR_INFO_INDEX_LITTER_NUM_TPC_PER_GPC:6,
+        nv_gpu.NV2080_CTRL_GR_INFO_INDEX_LITTER_NUM_SM_PER_TPC:2,
+      }
+      for index, value in info.items(): params.engineInfo[0].infoList[index].data = value
+      return params
+    raise RuntimeError(f"native NV control {cmd:#x} is not implemented")
+
+  def alloc(self, size:int, host=False, uncached=False, cpu_access=False, contiguous=False, force_devmem=False, zero=False,
+            **kwargs) -> BufferStorage:
+    memory = super().alloc(size, host=False, uncached=uncached, cpu_access=cpu_access, contiguous=contiguous,
+                           force_devmem=True, zero=zero, **kwargs)
+    if memory.meta.hMemory in self._native_memory: raise RuntimeError(f"native NV memory handle collision: {memory.meta.hMemory:#x}")
+    self._native_memory[memory.meta.hMemory] = memory
+    return memory
+
+  def alloc_usb_sram(self, size:int) -> BufferStorage:
+    return super().alloc(size, host=True, cpu_access=True, contiguous=True)
+
+  def alloc_usb_read_cq(self) -> BufferStorage:
+    # The validated completion page differs between macOS and Linux hosts.
+    mapping = self.dev_impl.mm.map_range(vaddr:=self.dev_impl.mm.alloc_vaddr(0x1000, 0x1000), 0x1000, [(0x822000 if OSX else 0x828000, 0x1000)],
+                                         aspace=AddrSpace.SYS, uncached=True)
+    return BufferStorage(vaddr, PCIAllocationMeta(mapping, has_cpu_mapping=False, hMemory=vaddr))
+
+  def free(self, storage:BufferStorage):
+    super().free(storage)
+    self._native_memory.pop(storage.meta.hMemory, None)
+
+  def device_fini(self):
+    errors:list[BaseException] = []
+    for action in (super().device_fini, self.pci_dev.usb.usb.free_dma_buffers):
+      try: action()
+      except BaseException as error: errors.append(error)
+    if errors: raise BaseExceptionGroup("NV USB shutdown failed", errors)
+
+  def sleep(self, timeout): pass
+
 class MOCKIface(NVKIface): count = 1
 
 class NVDevice(Compiled):
-  ifaces = [NVKIface, PCIIface, MOCKIface]
+  ifaces = [NVKIface, PCIIface, USBIface, MOCKIface]
   sleep_timeout_ms = 200
   pm_encode = PatternMatcher([
     (UPat(Ops.CUSTOM_FUNCTION, arg="submit_nv_compute", name="submit"), lambda ctx, submit: encode_submit(NVComputeQueue(ctx, submit))),
@@ -567,7 +732,20 @@ class NVDevice(Compiled):
 
   def __init__(self, device:str=""):
     self.iface = self._select_iface(device)
+    try: self._init_runtime(device)
+    except BaseException as error:
+      try:
+        if (fini:=getattr(self.iface, "device_fini", None)) is not None: fini()
+      except BaseException as cleanup_error:
+        raise BaseExceptionGroup("NV initialization and interface cleanup failed", [error, cleanup_error])
+      raise
+    if isinstance(self.iface, USBIface):
+      self.usb_sram_readback = bool(getenv("NV_USB_SRAM_READBACK", 0))
+      self.pm_stage_copy = pm_usb_stage
+      self.pm_lower = pm_usb_hostio
+      self.pm_bufferize = pm_usb_bufferize + self.pm_bufferize
 
+  def _init_runtime(self, device:str):
     device_params = nv_gpu.NV0080_ALLOC_PARAMETERS(deviceId=self.iface.gpu_instance, hClientShare=self.iface.root,
                                                    vaMode=nv_gpu.NV_DEVICE_ALLOCATION_VAMODE_OPTIONAL_MULTIPLE_VASPACES)
     self.nvdevice = self.iface.rm_alloc(self.iface.root, nv_gpu.NV01_DEVICE_0, device_params)
@@ -606,6 +784,38 @@ class NVDevice(Compiled):
     super().__init__(device, NVAllocator(self), [CUDARenderer, PTXRenderer, NVCCRenderer, NAKRenderer], None, arch=self.arch)
 
     self.pma_enabled, self.pma_exec_counter = PMA.value > 0 and PROFILE >= 1, itertools.count(0)
+
+  @functools.cached_property
+  def usb_sram(self) -> Buffer:
+    if not isinstance(self.iface, USBIface): raise RuntimeError("USB staging is only available through USBIface")
+    memory = self.iface.alloc_usb_sram(256 << 10)
+    return Buffer(self.device, 256 << 10, dtypes.uint8, opaque=memory)
+
+  @functools.cached_property
+  def usb_upload(self) -> Buffer:
+    # Shared synchronous staging must not consume a runtime-ring allocation for every copy in a large schedule.
+    return Buffer("CPU", 256 << 10, dtypes.uint8, preallocate=True)
+
+  @functools.cached_property
+  def usb_download(self) -> Buffer:
+    if not isinstance(self.iface, USBIface): raise RuntimeError("USB DMA staging is only available through USBIface")
+    if OSX: return Buffer("CPU", 512 << 10, dtypes.uint8, preallocate=True)
+    return Buffer("CPU", 512 << 10, dtypes.uint8, opaque=self.iface.pci_dev.usb.usb.alloc_dma(512 << 10))
+
+  @functools.cached_property
+  def usb_readback(self) -> Buffer:
+    if not isinstance(self.iface, USBIface): raise RuntimeError("USB readback is only available through USBIface")
+    return Buffer(self.device, 256 << 10, dtypes.uint8, options=BufferSpec(cpu_access=True, nolru=True), preallocate=True)
+
+  @functools.cached_property
+  def usb_readback_done(self) -> Buffer:
+    if not isinstance(self.iface, USBIface): raise RuntimeError("USB readback is only available through USBIface")
+    return Buffer(self.device, 1, dtypes.uint64, options=BufferSpec(cpu_access=True, nolru=True), preallocate=True)
+
+  @functools.cached_property
+  def usb_read_cq(self) -> Buffer:
+    if not isinstance(self.iface, USBIface): raise RuntimeError("USB read completion is only available through USBIface")
+    return Buffer(self.device, 0x1000, dtypes.uint8, opaque=self.iface.alloc_usb_read_cq())
 
   @functools.cached_property
   def fifos(self) -> dict[str, GPFifo]:
@@ -654,8 +864,7 @@ class NVDevice(Compiled):
       gpput=self.gpfifo_buf.view(1, dtypes.uint32, gpput_off).ensure_allocated(),
       doorbell=Buffer("CPU", 1, dtypes.uint32, options=BufferSpec(external_ptr=self.gpu_mmio.addr + 0x90), preallocate=True),
       put_value=Buffer("CPU", 1, dtypes.uint64, preallocate=True), notifier=notifier, entries=entries, token=ws_token_params.workSubmitToken)
-    self.pm_bufferize = PatternMatcher([(UPat(Ops.PARAM, tag=to_name(n, name)), lambda ctx, b=getattr(fifo, n): b)
-                                        for n in ("ring", "gpput", "doorbell", "put_value")]) + self.pm_bufferize
+    self.pm_bufferize = _queue_bufferizer(fifo, name) + self.pm_bufferize
     return fifo
 
   def _query_gpu_info(self, *reqs):

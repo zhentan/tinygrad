@@ -1,5 +1,5 @@
 from __future__ import annotations
-import os, mmap, array, functools, ctypes, ctypes.util, select, contextlib, dataclasses, sys, struct, socket
+import os, mmap, array, functools, ctypes, ctypes.util, select, contextlib, dataclasses, sys, struct, socket, time
 from tinygrad.device import BufferStorage, Buffer, Device
 from tinygrad.helpers import round_up, getenv, OSX, temp, ceildiv, DEBUG, pluralize
 from tinygrad.runtime.autogen import libc, pci, vfio
@@ -90,8 +90,10 @@ class _System:
 
   def pci_setup_usb_bars(self, usb:CustomASM24Controller, gpu_bus:int, mem_base:int, pref_mem_base:int) -> dict[int, tuple[int, int]]:
     for bus in range(gpu_bus):
+      assert usb.pcie_cfg_req(pci.PCI_HEADER_TYPE, bus=bus, dev=0, fn=0, size=1) & 0x7f == pci.PCI_HEADER_TYPE_BRIDGE, \
+        f"Expected PCI bridge at bus {bus}"
       # All 3 values must be written at the same time.
-      buses = (0 << 0) | ((bus+1) << 8) | ((gpu_bus) << 16)
+      buses = bus | ((bus+1) << 8) | (gpu_bus << 16)
       usb.pcie_cfg_req(pci.PCI_PRIMARY_BUS, bus=bus, dev=0, fn=0, value=buses, size=4)
 
       usb.pcie_cfg_req(pci.PCI_MEMORY_BASE, bus=bus, dev=0, fn=0, value=(mem_base>>16) & 0xffff, size=2)
@@ -103,13 +105,19 @@ class _System:
 
       usb.pcie_cfg_req(pci.PCI_COMMAND, bus=bus, dev=0, fn=0, value=pci.PCI_COMMAND_IO | pci.PCI_COMMAND_MEMORY | pci.PCI_COMMAND_MASTER, size=1)
 
-    # resize bar 0
+    cmd = usb.pcie_cfg_req(pci.PCI_COMMAND, bus=gpu_bus, dev=0, fn=0, size=2)
+    usb.pcie_cfg_req(pci.PCI_COMMAND, bus=gpu_bus, dev=0, fn=0, value=cmd & ~pci.PCI_COMMAND_MEMORY, size=2)
+
+    # resize all supported BARs
     cap_ptr = 0x100
     while cap_ptr:
       if pci.PCI_EXT_CAP_ID(hdr:=usb.pcie_cfg_req(cap_ptr, bus=gpu_bus, dev=0, fn=0, size=4)) == pci.PCI_EXT_CAP_ID_REBAR:
-        cap = usb.pcie_cfg_req(cap_ptr + 0x04, bus=gpu_bus, dev=0, fn=0, size=4)
-        new_ctrl = (usb.pcie_cfg_req(cap_ptr + 0x08, bus=gpu_bus, dev=0, fn=0, size=4) & ~0x1F00) | ((int(cap >> 4).bit_length() - 1) << 8)
-        usb.pcie_cfg_req(cap_ptr + 0x08, bus=gpu_bus, dev=0, fn=0, value=new_ctrl, size=4)
+        ctrl = usb.pcie_cfg_req(cap_ptr + 0x08, bus=gpu_bus, dev=0, fn=0, size=4)
+        for i in range((ctrl & pci.PCI_REBAR_CTRL_NBAR_MASK) >> pci.PCI_REBAR_CTRL_NBAR_SHIFT):
+          cap = usb.pcie_cfg_req(cap_ptr + 0x04 + 8*i, bus=gpu_bus, dev=0, fn=0, size=4)
+          ctrl = usb.pcie_cfg_req(cap_ptr + 0x08 + 8*i, bus=gpu_bus, dev=0, fn=0, size=4)
+          new_ctrl = (ctrl & ~0x1F00) | ((int(cap >> 4).bit_length() - 1) << 8)
+          usb.pcie_cfg_req(cap_ptr + 0x08 + 8*i, bus=gpu_bus, dev=0, fn=0, value=new_ctrl, size=4)
 
       cap_ptr = pci.PCI_EXT_CAP_NEXT(hdr)
 
@@ -231,15 +239,75 @@ class USBPCIDevice(PCIDevice):
     usb = USB3(dev)
     if DEBUG >= 1: print(f"am {self.pcibus}: product string: {usb.product!r}")
     self.usb: CustomASM24Controller = CustomASM24Controller(usb)
-    self._bar_info = System.pci_setup_usb_bars(self.usb, gpu_bus=4, mem_base=0x10000000, pref_mem_base=(32 << 30))
+    # Number the point-to-point bridge chain before accessing each downstream device.
+    for self.gpu_bus in range(256):
+      if (header:=self.read_config(pci.PCI_HEADER_TYPE, 1) & pci.PCI_HEADER_TYPE_MASK) == pci.PCI_HEADER_TYPE_NORMAL: break
+      assert header == pci.PCI_HEADER_TYPE_BRIDGE and self.gpu_bus < 255, f"Expected PCI bridge or endpoint at bus {self.gpu_bus}"
+      self.write_config(pci.PCI_PRIMARY_BUS, self.gpu_bus | ((self.gpu_bus+1) << 8) | 0xff0000, 4)
+    assert self.read_config(pci.PCI_VENDOR_ID, 2) not in (0, 0xffff), f"No PCI endpoint at bus {self.gpu_bus}"
+    self._mem_base, self._pref_mem_base = 0x10000000, 32 << 30
+    self._bar_info = System.pci_setup_usb_bars(self.usb, gpu_bus=self.gpu_bus, mem_base=self._mem_base, pref_mem_base=self._pref_mem_base)
     self.sram = BumpAllocator(size=0x80000, wrap=False) # asm24 controller sram
 
   def dma_view(self, ctrl_addr, size): return USBMMIOInterface(self.usb, ctrl_addr, size, fmt='B', pcimem=False)
   def alloc_sysmem(self, size:int, vaddr:int=0, contiguous:bool=False) -> tuple[MMIOInterface, list[int]]:
-    return self.dma_view(0xf000 + (off:=self.sram.alloc(size)), size), [0x200000 + off]
+    off = self.sram.alloc(size)
+    return self.dma_view(0xf000 + off, size), [0x200000 + off + page for page in range(0, size, 0x1000)]
 
-  def read_config(self, offset:int, size:int): return self.usb.pcie_cfg_req(offset, bus=4, dev=0, fn=0, size=size)
-  def write_config(self, offset:int, value:int, size:int): self.usb.pcie_cfg_req(offset, bus=4, dev=0, fn=0, value=value, size=size)
+  def read_config(self, offset:int, size:int): return self.usb.pcie_cfg_req(offset, bus=self.gpu_bus, dev=0, fn=0, size=size)
+  def write_config(self, offset:int, value:int, size:int): self.usb.pcie_cfg_req(offset, bus=self.gpu_bus, dev=0, fn=0, value=value, size=size)
+
+  def reset(self):
+    def disable_bus_mastering():
+      command = self.read_config(pci.PCI_COMMAND, 2)
+      self.write_config_flush(pci.PCI_COMMAND, command & ~pci.PCI_COMMAND_MASTER, 2)
+      if self.read_config(pci.PCI_COMMAND, 2) & pci.PCI_COMMAND_MASTER: raise RuntimeError("USB PCI reset left bus mastering enabled")
+
+    disable_bus_mastering()
+    expected_identity = self.usb.pcie_cfg_req(pci.PCI_VENDOR_ID, bus=self.gpu_bus, dev=0, fn=0, size=4)
+    if expected_identity in (0, 0xffffffff): raise RuntimeError("USB PCI endpoint identity is unavailable before reset")
+    bridge_bus = self.gpu_bus - 1
+    if bridge_bus < 0 or self.usb.pcie_cfg_req(pci.PCI_HEADER_TYPE, bus=bridge_bus, dev=0, fn=0, size=1) & \
+       pci.PCI_HEADER_TYPE_MASK != pci.PCI_HEADER_TYPE_BRIDGE:
+      raise RuntimeError("USB PCI endpoint has no immediate upstream bridge")
+    bridge_control = self.usb.pcie_cfg_req(pci.PCI_BRIDGE_CONTROL, bus=bridge_bus, dev=0, fn=0, size=2)
+    if bridge_control & pci.PCI_BRIDGE_CTL_BUS_RESET: raise RuntimeError("USB PCI secondary-bus reset is already asserted")
+    try:
+      self.usb.pcie_cfg_req(pci.PCI_BRIDGE_CONTROL, bus=bridge_bus, dev=0, fn=0,
+                            value=bridge_control | pci.PCI_BRIDGE_CTL_BUS_RESET, size=2)
+      if self.usb.pcie_cfg_req(pci.PCI_BRIDGE_CONTROL, bus=bridge_bus, dev=0, fn=0, size=2) != \
+         bridge_control | pci.PCI_BRIDGE_CTL_BUS_RESET:
+        raise RuntimeError("USB PCI secondary-bus reset assertion did not read back")
+      time.sleep(0.002)
+    finally:
+      try: self.usb.pcie_cfg_req(pci.PCI_BRIDGE_CONTROL, bus=bridge_bus, dev=0, fn=0, value=bridge_control, size=2)
+      finally: time.sleep(0.1)
+    if self.usb.pcie_cfg_req(pci.PCI_BRIDGE_CONTROL, bus=bridge_bus, dev=0, fn=0, size=2) != bridge_control:
+      raise RuntimeError("USB PCI secondary-bus reset deassertion did not read back")
+
+    deadline = time.monotonic() + 1
+    while True:
+      try: identity = self.usb.pcie_cfg_req(pci.PCI_VENDOR_ID, bus=self.gpu_bus, dev=0, fn=0, size=4)
+      except RuntimeError: identity = None
+      if identity == expected_identity: break
+      if identity not in (None, 0, 0xffffffff): raise RuntimeError(f"USB PCI endpoint identity changed across reset: {identity:#x}")
+      if time.monotonic() >= deadline: raise RuntimeError("USB PCI endpoint did not return after secondary-bus reset")
+      time.sleep(0.05)
+
+    prior_bars = self._bar_info
+    try:
+      restored_bars = System.pci_setup_usb_bars(self.usb, gpu_bus=self.gpu_bus,
+                                                mem_base=self._mem_base, pref_mem_base=self._pref_mem_base)
+      if restored_bars != prior_bars: raise RuntimeError(f"USB PCI BAR mapping changed across reset: {restored_bars} != {prior_bars}")
+    except BaseException as error:
+      try: disable_bus_mastering()
+      except BaseException as cleanup_error:
+        raise BaseExceptionGroup("USB PCI reset and bus-master cleanup failed", [error, cleanup_error])
+      raise
+    disable_bus_mastering()
+    status = self.read_config(pci.PCI_STATUS, 2)
+    if status & 0xf900: raise RuntimeError(f"USB PCI status fault after reset: {status:#x}")
+    self.sram = BumpAllocator(size=0x80000, wrap=False)
 
   def bar_info(self, bar_idx:int) -> tuple[int, int]: return self._bar_info[bar_idx]  # type: ignore[override]
   def map_bar(self, bar, off=0, addr=0, size=None, fmt='B'):
@@ -273,11 +341,12 @@ class PCIIfaceBase:
       vaddr = self.dev_impl.mm.alloc_vaddr(size:=round_up(size, mmap.PAGESIZE), align=mmap.PAGESIZE)
       memview, paddrs = self.pci_dev.alloc_sysmem(size, vaddr=vaddr, contiguous=contiguous)
       mapping = self.dev_impl.mm.map_range(vaddr, size, [(paddr, 0x1000) for paddr in paddrs], aspace=AddrSpace.SYS, snooped=True, uncached=True)
-      return BufferStorage(vaddr, PCIAllocationMeta(mapping, has_cpu_mapping=True, hMemory=paddrs[0]), memview)
+      return BufferStorage(vaddr, PCIAllocationMeta(mapping, has_cpu_mapping=not isinstance(memview, USBMMIOInterface), hMemory=paddrs[0]), memview)
 
     mapping = self.dev_impl.mm.valloc(size:=round_up(size, 0x1000), uncached=uncached, contiguous=cpu_access, zero=zero)
     barview = self.pci_dev.map_bar(bar=self.vram_bar, off=mapping.paddrs[0][0], size=mapping.size) if cpu_access else None
-    return BufferStorage(mapping.va_addr, PCIAllocationMeta(mapping, cpu_access, hMemory=mapping.paddrs[0][0]), barview)
+    return BufferStorage(mapping.va_addr,
+                         PCIAllocationMeta(mapping, cpu_access and not isinstance(barview, USBMMIOInterface), hMemory=mapping.paddrs[0][0]), barview)
 
   def free(self, storage:BufferStorage):
     if storage.meta.mapping.aspace is AddrSpace.PHYS: self.dev_impl.mm.vfree(storage.meta.mapping)
